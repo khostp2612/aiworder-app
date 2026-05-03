@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 语音权限 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 网络权限（模型下载） -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 前台Service权限 - 推理时保持CPU优先级 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 通知权限（Android 13+，HarmonyOS 忽略） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 允许安装带此权限的包（华为/鸿蒙兼容） -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" tools:node="remove" />
+
+    <application
+        android:name=".App"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.AICustomer"
+        android:largeHeap="true"
+        android:hardwareAccelerated="true"
+        android:usesCleartextTraffic="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:extractNativeLibs="true"
+        tools:targetApi="34">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 推理前台Service - 获取CPU高优先级调度，防止系统杀进程 -->
+        <service
+            android:name=".engine.InferenceService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
+
+        <!-- Sherpa-ONNX STT/VAD Service - 独立进程隔离原生库冲突 -->
+        <service
+            android:name=".engine.SherpaService"
+            android:process=":sherpa"
+            android:exported="false" />
+    </application>
+</manifest>

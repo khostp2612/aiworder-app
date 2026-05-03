@@ -1,0 +1,165 @@
+package com.aicustomer
+
+import android.app.Application
+import android.content.Intent
+import android.os.Process
+import android.util.Log
+import com.aicustomer.data.local.AppDatabase
+import com.aicustomer.data.local.SecureStorage
+import com.aicustomer.engine.EmbeddingEngine
+import com.aicustomer.engine.LlmEngine
+import com.aicustomer.engine.ModelManager
+
+import com.aicustomer.identity.IdentityManager
+import com.aicustomer.memory.MemoryManager
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+class App : Application() {
+
+    lateinit var llmEngine: LlmEngine
+        private set
+    lateinit var embeddingEngine: EmbeddingEngine
+        private set
+    lateinit var memoryManager: MemoryManager
+        private set
+    lateinit var identityManager: IdentityManager
+        private set
+    lateinit var modelManager: ModelManager
+        private set
+
+    lateinit var secureStorage: SecureStorage
+        private set
+
+    var voiceCallViewModel: com.aicustomer.ui.viewmodel.VoiceCallViewModel? = null
+
+    lateinit var database: AppDatabase
+        private set
+
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // 模型提取锁 - 确保loadModel等待extractBundledModel完成
+    private val modelExtractionMutex = Mutex()
+    private var modelExtractionDone = false
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+
+        // 全局异常捕获 - 捕获后重启Activity防止"屡次停止运行"
+        // 华为/鸿蒙限制：最多尝试重启1次，避免崩溃循环导致CPU飙升
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            Log.e("App", "Uncaught exception on thread: ${thread.name}", throwable)
+            val prefs = getSharedPreferences("crash_prefs", MODE_PRIVATE)
+            val crashCount = prefs.getInt("crash_count", 0) + 1
+            val lastCrashTime = prefs.getLong("last_crash_time", 0)
+            val now = System.currentTimeMillis()
+
+            if (crashCount == 1 || (crashCount <= 2 && (now - lastCrashTime) > 30000)) {
+                prefs.edit()
+                    .putInt("crash_count", crashCount)
+                    .putLong("last_crash_time", now)
+                    .apply()
+                try {
+                    val intent = Intent(this, MainActivity::class.java).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                        putExtra("crash", true)
+                    }
+                    startActivity(intent)
+                } catch (e: Exception) {
+                    Log.e("App", "Failed to restart activity", e)
+                }
+            } else {
+                prefs.edit().putInt("crash_count", 0).apply()
+                Log.w("App", "Too many crashes, giving up restart")
+            }
+            Process.killProcess(Process.myPid())
+        }
+
+        database = AppDatabase.getInstance(this)
+
+        secureStorage = SecureStorage(this)
+
+        // 清除测试阶段的污染记忆（只执行一次，后续可移除）
+        appScope.launch {
+            try {
+                database.memoryDao().deleteAllByType("short_term")
+                database.memoryDao().deleteAllByType("long_term")
+            } catch (_: Exception) {}
+        }
+
+        embeddingEngine = EmbeddingEngine(this)
+        llmEngine = LlmEngine(this)
+        memoryManager = MemoryManager(this, embeddingEngine, llmEngine, database)
+        identityManager = IdentityManager(database)
+        modelManager = ModelManager(this)
+
+        appScope.launch {
+            try {
+                identityManager.initFromPresetsIfNeeded()
+            } catch (e: Exception) {
+                Log.e("App", "Failed to init identity presets", e)
+            }
+        }
+
+        appScope.launch {
+            modelExtractionMutex.withLock {
+                try {
+                    // 1. 从assets提取内置0.5B模型（首次启动）
+                    val extracted = modelManager.extractBundledModel()
+                    if (!extracted) {
+                        Log.w("App", "Bundled model extraction failed, app will need manual model install")
+                    }
+                } catch (e: Exception) {
+                    Log.e("App", "Failed to extract bundled model", e)
+                }
+                modelExtractionDone = true
+            }
+
+            try {
+                embeddingEngine.load()
+                memoryManager.initVectorIndex()
+            } catch (e: Exception) {
+                Log.w("App", "Memory init failed", e)
+            }
+
+            try {
+                secureStorage.setDefaultCfUrl("ws://192.168.3.116:8000/v1/transcribe")
+            } catch (_: Exception) {}
+
+            // 加载知识文档
+            try {
+                val kbText = assets.open("knowledge_base.txt").bufferedReader().readText()
+                memoryManager.clearDocuments()
+                memoryManager.addDocument("客服工作流程", kbText)
+                Log.i("App", "Knowledge base loaded: ${kbText.length} chars")
+            } catch (e: Exception) {
+                Log.w("App", "Failed to load knowledge base", e)
+            }
+        }
+    }
+
+    override fun onTerminate() {
+        super.onTerminate()
+        memoryManager.destroy()
+    }
+
+    /**
+     * 等待模型提取完成 - ChatViewModel.loadModel调用此方法确保时序正确
+     */
+    suspend fun awaitModelExtraction() {
+        if (modelExtractionDone) return
+        modelExtractionMutex.withLock {
+            // 获取锁即表示提取已完成
+        }
+    }
+
+    companion object {
+        lateinit var instance: App
+            private set
+    }
+}

@@ -1,0 +1,10 @@
+kind: pipeline
+type: docker
+name: android-build
+
+steps:
+- name: build
+  image: gradle:8.5-jdk17
+  commands:
+  - chmod +x gradlew
+  - ./gradlew assembleDebug
