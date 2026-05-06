@@ -262,13 +262,15 @@ class VoicePipeline(
         var silenceStart = 0L
         var speechStarted = false
         var speechStartTime = 0L
-        val SILENCE_TIMEOUT = 1000L
+        val SILENCE_TIMEOUT = 600L
         val MAX_SPEECH_MS = 15000L
         val ENERGY_WINDOW = 6
         val energyHistory = ArrayDeque<Double>()
         val BASE_SPEECH_ENERGY = 300.0
         var interrupted = false
         var lastHeartbeat = 0L
+        val startupChunks = mutableListOf<FloatArray>()
+        val INITIAL_BUFFER_FRAMES = 5  // ~200ms 预热缓冲
 
         try {
             while (isActive) {
@@ -304,8 +306,11 @@ class VoicePipeline(
                             consecutiveAbove = 0
                             mainHandler.post { onAiInterrupted?.invoke() }
                             allSamples.clear()
+                            xfyunProvider?.abortStream()
+                            xfyunTranscribing = false
                             silenceStart = 0L
                             speechStarted = false
+                            startupChunks.clear()
                             delay(50)
                         }
                     } else {
@@ -319,38 +324,71 @@ class VoicePipeline(
                         if (!speechStarted) {
                             speechStarted = true
                             speechStartTime = now
+                            startupChunks.clear()
                         }
                         silenceStart = 0L
                         val processed = preprocessor.processShortToFloat(chunk)
-                        allSamples.addAll(processed.toList())
+
+                        if (xfyunTranscribing) {
+                            // 已在流式中，直接发送
+                            xfyunProvider?.sendStreamAudio(processed, isEnd = false)
+                        } else if (startupChunks.size < INITIAL_BUFFER_FRAMES) {
+                            // 预热缓冲：先攒 200ms 音频让讯飞拿到完整起音
+                            startupChunks.add(processed)
+                            if (startupChunks.size >= INITIAL_BUFFER_FRAMES) {
+                                xfyunTranscribing = true
+                                xfyunProvider?.beginStream(rate) { text ->
+                                    xfyunTranscribing = false
+                                    startupChunks.clear()
+                                    Log.i("VoicePipeline", "xfyun stream: '${text.take(50)}'")
+                                    if (text.isNotBlank() && isActive && !isProcessing) {
+                                        isProcessing = true
+                                        state = State.THINKING
+                                        mainHandler.post { onFinalText?.invoke(text) }
+                                    }
+                                }
+                                // 一次性发送积压的预热音频
+                                startupChunks.forEach { xfyunProvider?.sendStreamAudio(it, isEnd = false) }
+                                startupChunks.clear()
+                            }
+                        }
                     } else if (speechStarted) {
                         val processed = preprocessor.processShortToFloat(chunk)
-                        allSamples.addAll(processed.toList())
+                        if (xfyunTranscribing) {
+                            xfyunProvider?.sendStreamAudio(processed, isEnd = false)
+                        } else if (startupChunks.size < INITIAL_BUFFER_FRAMES) {
+                            startupChunks.add(processed)
+                            if (startupChunks.size >= INITIAL_BUFFER_FRAMES) {
+                                xfyunTranscribing = true
+                                xfyunProvider?.beginStream(rate) { text ->
+                                    xfyunTranscribing = false
+                                    startupChunks.clear()
+                                    Log.i("VoicePipeline", "xfyun stream: '${text.take(50)}'")
+                                    if (text.isNotBlank() && isActive && !isProcessing) {
+                                        isProcessing = true
+                                        state = State.THINKING
+                                        mainHandler.post { onFinalText?.invoke(text) }
+                                    }
+                                }
+                                startupChunks.forEach { xfyunProvider?.sendStreamAudio(it, isEnd = false) }
+                                startupChunks.clear()
+                            }
+                        }
                         if (silenceStart == 0L) silenceStart = now
                     }
 
-                    val silenceDone = speechStarted && silenceStart > 0 && (now - silenceStart) > SILENCE_TIMEOUT && allSamples.size >= rate
+                    val silenceDone = speechStarted && silenceStart > 0 && (now - silenceStart) > SILENCE_TIMEOUT
                     val exceededMax = speechStarted && (now - speechStartTime) > MAX_SPEECH_MS
 
-                    if ((silenceDone || exceededMax) && !xfyunTranscribing) {
-                        log("xfyun transcribe triggered silenceDone=$silenceDone max=$exceededMax samples=${allSamples.size}")
-                        xfyunTranscribing = true
-                        val copy = allSamples.toFloatArray()
-                        allSamples.clear()
+                    if ((silenceDone || exceededMax) && xfyunTranscribing) {
+                        log("xfyun stream end silence=$silenceDone max=$exceededMax")
                         speechStarted = false
                         silenceStart = 0L
                         energyHistory.clear()
                         interrupted = false
-
-                        xfyunProvider?.transcribe(copy, rate) { text ->
-                            xfyunTranscribing = false
-                            Log.i("VoicePipeline", "xfyun result: '${text.take(50)}' active=$isActive proc=$isProcessing")
-                            if (text.isNotBlank() && isActive && !isProcessing) {
-                                isProcessing = true
-                                state = State.THINKING
-                                mainHandler.post { onFinalText?.invoke(text) }
-                            }
-                        }
+                        startupChunks.clear()
+                        // 发送结束帧，Xfyun 已在实时处理，结果即刻返回
+                        xfyunProvider?.sendStreamAudio(FloatArray(0), isEnd = true)
                     }
                 }
             }
