@@ -128,7 +128,7 @@ class App : Application() {
             }
 
             try {
-                secureStorage.setDefaultCfUrl("ws://192.168.3.116:8000/v1/transcribe")
+                // 不在启动时设置默认值，避免覆盖用户配置
             } catch (_: Exception) {}
 
             // 加载知识文档

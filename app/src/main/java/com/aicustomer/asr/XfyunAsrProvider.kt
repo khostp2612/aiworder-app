@@ -19,7 +19,12 @@ class XfyunAsrProvider(
         .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
         .build()
     private var resultCallback: ((String) -> Unit)? = null
+    private var interimCallback: ((String) -> Unit)? = null
     private var resultText = ""
+
+    var onInterim: ((String) -> Unit)?
+        get() = interimCallback
+        set(v) { interimCallback = v }
 
     override fun isAvailable() = appId.isNotBlank() && apiKey.isNotBlank()
 
@@ -75,6 +80,7 @@ class XfyunAsrProvider(
                         }
                         resultText = sb.toString()
                         if (status == 2) { ws.close(1000, ""); callback(resultText) }
+                        else if (status == 1) { interimCallback?.invoke(resultText) }
                     }
                 } catch (_: Exception) {}
             }

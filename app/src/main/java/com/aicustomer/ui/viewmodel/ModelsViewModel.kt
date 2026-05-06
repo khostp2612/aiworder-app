@@ -44,7 +44,27 @@ class ModelsViewModel(application: Application) : ViewModel() {
     private val _cfUrl = MutableStateFlow("")
     val cfUrl: StateFlow<String> = _cfUrl.asStateFlow()
 
-    private val _useCloudLlm = MutableStateFlow(false)
+    // ASR provider preference
+    private val _asrProvider = MutableStateFlow("cf")
+    val asrProvider: StateFlow<String> = _asrProvider.asStateFlow()
+
+    // DeepSeek 独立凭证
+    private val _deepseekKey = MutableStateFlow("")
+    val deepseekKey: StateFlow<String> = _deepseekKey.asStateFlow()
+    private val _deepseekEndpoint = MutableStateFlow("")
+    val deepseekEndpoint: StateFlow<String> = _deepseekEndpoint.asStateFlow()
+    private val _deepseekModel = MutableStateFlow("")
+    val deepseekModel: StateFlow<String> = _deepseekModel.asStateFlow()
+
+    // 讯飞凭证
+    private val _xfyunAppId = MutableStateFlow("")
+    val xfyunAppId: StateFlow<String> = _xfyunAppId.asStateFlow()
+    private val _xfyunApiKey = MutableStateFlow("")
+    val xfyunApiKey: StateFlow<String> = _xfyunApiKey.asStateFlow()
+    private val _xfyunApiSecret = MutableStateFlow("")
+    val xfyunApiSecret: StateFlow<String> = _xfyunApiSecret.asStateFlow()
+
+    private val _useCloudLlm = MutableStateFlow(secureStorage.isCloudLlmEnabled())
     val useCloudLlm: StateFlow<Boolean> = _useCloudLlm.asStateFlow()
 
     sealed class ConnectionState {
@@ -119,6 +139,13 @@ class ModelsViewModel(application: Application) : ViewModel() {
         _openAiEndpoint.value = secureStorage.getEndpoint()
         _openAiModel.value = secureStorage.getModel()
         _cfUrl.value = secureStorage.getCfUrl()
+        _asrProvider.value = secureStorage.getAsrProvider()
+        _deepseekKey.value = secureStorage.getDeepseekKey()
+        _deepseekEndpoint.value = secureStorage.getDeepseekEndpoint()
+        _deepseekModel.value = secureStorage.getDeepseekModel()
+        _xfyunAppId.value = secureStorage.getXfyunAppId()
+        _xfyunApiKey.value = secureStorage.getXfyunApiKey()
+        _xfyunApiSecret.value = secureStorage.getXfyunApiSecret()
     }
 
     fun saveOpenAiKey(key: String, endpoint: String, model: String) {
@@ -133,6 +160,30 @@ class ModelsViewModel(application: Application) : ViewModel() {
         secureStorage.setCfUrl(url)
         loadApiKeys()
         _saveStatus.value = "ASR WebSocket 地址已保存"
+    }
+
+    fun saveDeepseekKey(key: String, endpoint: String, model: String) {
+        secureStorage.setDeepseekKey(key)
+        secureStorage.setDeepseekEndpoint(endpoint)
+        secureStorage.setDeepseekModel(model)
+        loadApiKeys()
+        _useCloudLlm.value = true
+        _saveStatus.value = "DeepSeek 凭证已保存，云端模式已开启"
+    }
+
+    fun saveXfyunCredentials(appId: String, apiKey: String, apiSecret: String) {
+        secureStorage.setXfyunAppId(appId)
+        secureStorage.setXfyunApiKey(apiKey)
+        secureStorage.setXfyunApiSecret(apiSecret)
+        secureStorage.setAsrProvider("xfyun")
+        loadApiKeys()
+        _saveStatus.value = "讯飞语音凭证已保存，已自动切换为讯飞识别"
+    }
+
+    fun saveAsrProvider(provider: String) {
+        secureStorage.setAsrProvider(provider)
+        loadApiKeys()
+        _saveStatus.value = if (provider == "xfyun") "已切换到讯飞语音识别" else "已切换到 Cloudflare 语音识别"
     }
 
     fun dismissSaveStatus() { _saveStatus.value = null }

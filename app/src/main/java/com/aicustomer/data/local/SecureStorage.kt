@@ -74,4 +74,64 @@ class SecureStorage(context: Context) {
             setCfUrl(url)
         }
     }
+
+    // === DeepSeek 独立凭证 ===
+    fun getDeepseekKey(): String {
+        migrateIfNeeded("deepseek_key")
+        return encryptedPrefs.getString("deepseek_key", "") ?: ""
+    }
+    fun setDeepseekKey(value: String) {
+        encryptedPrefs.edit().putString("deepseek_key", value).apply()
+    }
+
+    fun getDeepseekEndpoint(): String {
+        return plainPrefs.getString("deepseek_endpoint", "https://api.deepseek.com/v1") ?: ""
+    }
+    fun setDeepseekEndpoint(value: String) {
+        plainPrefs.edit().putString("deepseek_endpoint", value.ifBlank { "https://api.deepseek.com/v1" }).apply()
+    }
+
+    fun getDeepseekModel(): String {
+        return plainPrefs.getString("deepseek_model", "deepseek-chat") ?: "deepseek-chat"
+    }
+    fun setDeepseekModel(value: String) {
+        plainPrefs.edit().putString("deepseek_model", value.ifBlank { "deepseek-chat" }).apply()
+    }
+
+    // === 讯飞语音识别凭证 ===
+    fun getXfyunAppId(): String {
+        return plainPrefs.getString("xfyun_app_id", "") ?: ""
+    }
+    fun setXfyunAppId(value: String) {
+        plainPrefs.edit().putString("xfyun_app_id", value).apply()
+    }
+
+    fun getXfyunApiKey(): String {
+        migrateIfNeeded("xfyun_api_key")
+        return encryptedPrefs.getString("xfyun_api_key", "") ?: ""
+    }
+    fun setXfyunApiKey(value: String) {
+        encryptedPrefs.edit().putString("xfyun_api_key", value).apply()
+    }
+
+    fun getXfyunApiSecret(): String {
+        migrateIfNeeded("xfyun_api_secret")
+        return encryptedPrefs.getString("xfyun_api_secret", "") ?: ""
+    }
+    fun setXfyunApiSecret(value: String) {
+        encryptedPrefs.edit().putString("xfyun_api_secret", value).apply()
+    }
+
+    // === ASR 提供商偏好 ===
+    fun getAsrProvider(): String {
+        return plainPrefs.getString("asr_provider", "cf") ?: "cf"
+    }
+    fun setAsrProvider(value: String) {
+        plainPrefs.edit().putString("asr_provider", value).apply()
+    }
+
+    // === 云端模式 ===
+    fun isCloudLlmEnabled(): Boolean {
+        return getDeepseekKey().isNotBlank() || getApiKey().isNotBlank()
+    }
 }

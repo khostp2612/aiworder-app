@@ -57,7 +57,7 @@ class ChatViewModel(application: Application) : ViewModel() {
     private val _activeIdentityName = MutableStateFlow("")
     val activeIdentityName: StateFlow<String> = _activeIdentityName.asStateFlow()
 
-    private val _useCloudLlm = MutableStateFlow(false)
+    private val _useCloudLlm = MutableStateFlow(true)
     val useCloudLlm: StateFlow<Boolean> = _useCloudLlm.asStateFlow()
     private val _cloudAvailable = MutableStateFlow(false)
     val cloudAvailable: StateFlow<Boolean> = _cloudAvailable.asStateFlow()
@@ -73,14 +73,19 @@ class ChatViewModel(application: Application) : ViewModel() {
     private var thinkBuffer = StringBuilder()
 
     init {
-        loadModel()
         checkCloudAvailability()
+        if (!cloudAvailable.value) {
+            loadModel()
+        } else {
+            _aiStatus.value = "云端就绪"
+            _isModelLoaded.value = true
+        }
     }
 
     fun toggleCloudLlm() { _useCloudLlm.value = !_useCloudLlm.value }
 
     private fun checkCloudAvailability() {
-        _cloudAvailable.value = app.secureStorage.getApiKey().isNotBlank()
+        _cloudAvailable.value = app.secureStorage.isCloudLlmEnabled()
     }
 
     fun loadModel() {
@@ -232,7 +237,8 @@ class ChatViewModel(application: Application) : ViewModel() {
     }
 
     private suspend fun generateResponse() {
-        if (!llmEngine.isLoaded()) {
+        val useCloud = _useCloudLlm.value && app.secureStorage.isCloudLlmEnabled()
+        if (!useCloud && !llmEngine.isLoaded()) {
             _messages.value = _messages.value + Message(
                 role = "assistant",
                 content = "模型尚未加载，请在模型管理中确认模型已下载。",
@@ -259,11 +265,12 @@ class ChatViewModel(application: Application) : ViewModel() {
             val systemPrompt = promptBuilder.build(identity, memoryContext)
             val userMsg = _messages.value.lastOrNull { it.role == "user" }?.content ?: ""
 
-            // 检查是否启用云端大模型
-            if (_useCloudLlm.value && app.secureStorage.getApiKey().isNotBlank()) {
-                val endpoint = app.secureStorage.getEndpoint()
-                val model = app.secureStorage.getModel()
-                generateCloudResponse(systemPrompt, userMsg, app.secureStorage.getApiKey(), endpoint, model)
+            // 检查是否启用云端大模型（优先DeepSeek，其次OpenAI兼容）
+            if (useCloud) {
+                val key = app.secureStorage.getDeepseekKey().ifBlank { app.secureStorage.getApiKey() }
+                val endpoint = if (app.secureStorage.getDeepseekKey().isNotBlank()) app.secureStorage.getDeepseekEndpoint() else app.secureStorage.getEndpoint()
+                val model = if (app.secureStorage.getDeepseekKey().isNotBlank()) app.secureStorage.getDeepseekModel() else app.secureStorage.getModel()
+                generateCloudResponse(systemPrompt, userMsg, key, endpoint, model)
                 return
             }
 

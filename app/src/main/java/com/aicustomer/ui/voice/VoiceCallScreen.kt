@@ -15,6 +15,8 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
@@ -108,14 +110,43 @@ fun VoiceCallScreen(
         }
 
         // Recognition / Response text area
-        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).weight(0.6f), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).weight(0.6f),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            // 用户实时语音识别（interim）
             if (callState == VoiceCallState.LISTENING && userSpeechText.isNotBlank()) {
-                Text(userSpeechText, color = Color.White.copy(alpha = 0.85f), style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Light), textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+                Text(
+                    userSpeechText, color = Color.White.copy(alpha = 0.85f),
+                    style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Light),
+                    textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()
+                )
             }
+            // AI 流式回复
             if (aiResponseText.isNotBlank()) {
                 Spacer(modifier = Modifier.height(8.dp))
-                Surface(shape = RoundedCornerShape(16.dp), color = Color.White.copy(alpha = 0.08f), modifier = Modifier.fillMaxWidth()) {
-                    Text(aiResponseText.takeLast(250), modifier = Modifier.padding(14.dp), color = Color.White.copy(alpha = 0.65f), style = MaterialTheme.typography.bodyMedium, lineHeight = 22.sp)
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = Color.White.copy(alpha = 0.08f),
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 200.dp)
+                ) {
+                    val scrollState = rememberScrollState()
+                    LaunchedEffect(aiResponseText) { scrollState.animateScrollTo(scrollState.maxValue) }
+                    Text(
+                        aiResponseText,
+                        modifier = Modifier.padding(14.dp).verticalScroll(scrollState),
+                        color = Color.White.copy(alpha = 0.7f),
+                        style = MaterialTheme.typography.bodyMedium, lineHeight = 22.sp
+                    )
+                }
+            }
+            // 思考中动画
+            if (callState == VoiceCallState.THINKING && aiResponseText.isBlank()) {
+                Spacer(modifier = Modifier.height(16.dp))
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = Color.White.copy(alpha = 0.5f))
+                    Text("思考中...", color = Color.White.copy(alpha = 0.5f), style = MaterialTheme.typography.bodySmall)
                 }
             }
         }

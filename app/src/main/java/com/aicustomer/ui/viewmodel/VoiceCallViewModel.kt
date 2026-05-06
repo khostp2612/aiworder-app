@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.aicustomer.App
 import com.aicustomer.data.model.Message
 import com.aicustomer.engine.InferenceService
+import com.aicustomer.engine.OpenAiClient
 import com.aicustomer.identity.PromptBuilder
 import com.aicustomer.voice.VoicePipeline
 import kotlinx.coroutines.Dispatchers
@@ -19,15 +20,11 @@ class VoiceCallViewModel(application: Application) : ViewModel() {
 
     private val app = application as App
     init { app.voiceCallViewModel = this }
-    private val llmEngine = app.llmEngine
     private val memoryManager = app.memoryManager
     private val identityManager = app.identityManager
     private val promptBuilder = PromptBuilder()
 
-    val voicePipeline = VoicePipeline(
-        context = application,
-        llmEngine = llmEngine
-    )
+    val voicePipeline = VoicePipeline(context = application)
 
     private val _callState = MutableStateFlow(VoiceCallState.IDLE)
     val callState: StateFlow<VoiceCallState> = _callState.asStateFlow()
@@ -43,40 +40,53 @@ class VoiceCallViewModel(application: Application) : ViewModel() {
     private var callStartTime = 0L
     private var callEnded = false
 
-    // Local accumulator for voice response text (bypasses async StateFlow race)
-    private var voiceResponseAccum = ""
+    // 流式累积
+    private var aiResponseAccum = ""
+    private var lastSpeakIdx = 0
+
+    // 活跃的 LLM 客户端（用于中断）
+    @Volatile private var activeClient: OpenAiClient? = null
 
     init {
         voicePipeline.onStateChanged = { s ->
             viewModelScope.launch {
                 _callState.value = when (s) {
-                    VoicePipeline.State.PROCESSING -> VoiceCallState.THINKING
+                    VoicePipeline.State.THINKING -> VoiceCallState.THINKING
                     VoicePipeline.State.SPEAKING -> VoiceCallState.SPEAKING
                     VoicePipeline.State.IDLE -> VoiceCallState.IDLE
                     else -> VoiceCallState.LISTENING
                 }
             }
         }
-        voicePipeline.onPartialText = { t -> viewModelScope.launch { _userSpeechText.value = t } }
+        voicePipeline.onInterimText = { t ->
+            viewModelScope.launch { _userSpeechText.value = t }
+        }
         voicePipeline.onFinalText = { t ->
             viewModelScope.launch {
+                android.util.Log.i("VoiceCallVM", "onFinalText: '${t.take(50)}'")
                 _userSpeechText.value = t
                 if (t.isNotBlank()) processUserSpeech(t)
             }
         }
-        voicePipeline.onResponseText = { t ->
-            voiceResponseAccum += t
-            viewModelScope.launch { _aiResponseText.value = voiceResponseAccum }
+        voicePipeline.onAiToken = { t ->
+            viewModelScope.launch { _aiResponseText.value = aiResponseAccum }
+        }
+        voicePipeline.onAiInterrupted = {
+            viewModelScope.launch { handleAiInterrupted() }
         }
     }
 
     fun startCall() {
         viewModelScope.launch {
-            if (!llmEngine.isLoaded()) { _statusHint.value = "模型未加载"; return@launch }
+            val useCloud = app.secureStorage.isCloudLlmEnabled()
+            if (!useCloud) { _statusHint.value = "请先配置云端大模型"; return@launch }
+
             callEnded = false
             isCallActive = true; callStartTime = System.currentTimeMillis()
             _callState.value = VoiceCallState.LISTENING; _statusHint.value = "正在聆听..."
-            _userSpeechText.value = ""; _aiResponseText.value = ""; voiceResponseAccum = ""
+            _userSpeechText.value = ""; _aiResponseText.value = ""
+            aiResponseAccum = ""; lastSpeakIdx = 0; generationId = 0L
+
             launch { while (isCallActive) { _callElapsed.value = (System.currentTimeMillis() - callStartTime) / 1000; kotlinx.coroutines.delay(1000) } }
             voicePipeline.startVoiceCall()
         }
@@ -91,7 +101,8 @@ class VoiceCallViewModel(application: Application) : ViewModel() {
         callEnded = true
         isCallActive = false
         _callState.value = VoiceCallState.IDLE
-        llmEngine.abort()
+        activeClient?.abort()
+        activeClient = null
         voicePipeline.endCall()
         InferenceService.stop(app)
         viewModelScope.launch(Dispatchers.IO) {
@@ -100,64 +111,103 @@ class VoiceCallViewModel(application: Application) : ViewModel() {
         }
     }
 
+    private var generationId = 0L
+
+    private fun handleAiInterrupted() {
+        activeClient?.abort()
+        activeClient = null
+        generationId++
+        aiResponseAccum = ""
+        lastSpeakIdx = 0
+        _aiResponseText.value = ""
+        _statusHint.value = "正在聆听..."
+        _callState.value = VoiceCallState.LISTENING
+    }
+
     private suspend fun processUserSpeech(text: String) {
-        _statusHint.value = "思考中..."; _callState.value = VoiceCallState.THINKING; _aiResponseText.value = ""; voiceResponseAccum = ""
+        _statusHint.value = "思考中..."; _callState.value = VoiceCallState.THINKING
+        _aiResponseText.value = ""; aiResponseAccum = ""; lastSpeakIdx = 0
+        generationId++
+        val myGenId = generationId
+
         val userMessage = Message(role = "user", content = text, conversationId = "voice_call", isVoice = true)
 
         val identity = identityManager.getActiveIdentity()
         val memCtx = memoryManager.buildMemoryContext(text)
         val sysPrompt = promptBuilder.build(identity, memCtx)
 
-        // 检查云端大模型
-        val prefs = app.getSharedPreferences("asr_prefs", android.content.Context.MODE_PRIVATE)
-        val cloudKey = prefs.getString("openai_key", "") ?: ""
+        val cloudKey = app.secureStorage.getDeepseekKey().ifBlank { app.secureStorage.getApiKey() }
         if (cloudKey.isNotBlank()) {
-            val endpoint = prefs.getString("openai_endpoint", "https://api.deepseek.com/v1") ?: ""
-            val model = prefs.getString("openai_model", "deepseek-chat") ?: "deepseek-chat"
-            val client = com.aicustomer.engine.OpenAiClient(cloudKey, endpoint, model)
+            val endpoint = if (app.secureStorage.getDeepseekKey().isNotBlank()) app.secureStorage.getDeepseekEndpoint() else app.secureStorage.getEndpoint()
+            val model = if (app.secureStorage.getDeepseekKey().isNotBlank()) app.secureStorage.getDeepseekModel() else app.secureStorage.getModel()
+            val client = OpenAiClient(cloudKey, endpoint, model)
+            activeClient = client
             InferenceService.start(app)
+
+            var wasAborted = false
             try {
                 kotlinx.coroutines.withContext(Dispatchers.IO) {
                     client.chatStream(sysPrompt, text).collect { token ->
+                        if (generationId != myGenId) { wasAborted = true; throw kotlinx.coroutines.CancellationException("interrupted") }
                         if (token.startsWith("[云端请求失败")) {
-                            voiceResponseAccum = token
-                        } else {
-                            voiceResponseAccum += token
-                            _aiResponseText.value = voiceResponseAccum
+                            aiResponseAccum = token
+                            return@collect
+                        }
+                        aiResponseAccum += token
+                        _aiResponseText.value = aiResponseAccum
+
+                        val current = aiResponseAccum
+                        for (sep in listOf("。", "！", "？", "；", "\n")) {
+                            val idx = current.indexOf(sep, lastSpeakIdx)
+                            if (idx >= 0) {
+                                val sentence = current.substring(lastSpeakIdx, idx + 1).trim()
+                                if (sentence.isNotBlank() && sentence.length > 1) {
+                                    voicePipeline.queueTtsSentence(sentence)
+                                }
+                                lastSpeakIdx = idx + 1
+                            }
                         }
                     }
                 }
-                if (voiceResponseAccum.isNotBlank() && !voiceResponseAccum.startsWith("[云端")) {
-                    voicePipeline.voiceChat(voiceResponseAccum)
-                } else {
-                    _callState.value = VoiceCallState.LISTENING; _statusHint.value = "正在聆听..."
-                }
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                wasAborted = true
+            } catch (e: Exception) {
+                if (generationId != myGenId) wasAborted = true
             } finally {
+                activeClient = null
                 InferenceService.stop(app)
             }
+
+            // 被打断则跳过后续处理
+            if (wasAborted || generationId != myGenId) {
+                _userSpeechText.value = ""
+                voicePipeline.onProcessingComplete()
+                return
+            }
+
+            // 剩余文本
+            if (aiResponseAccum.isNotBlank() && !aiResponseAccum.startsWith("[云端")) {
+                val remaining = aiResponseAccum.substring(lastSpeakIdx)
+                    .replace(Regex("<[^>]*>"), "").trim()
+                if (remaining.isNotBlank()) {
+                    voicePipeline.queueTtsSentence(remaining)
+                }
+            }
+
+            if (isCallActive && aiResponseAccum.isNotBlank()) {
+                viewModelScope.launch(Dispatchers.IO) {
+                    memoryManager.onAssistantMessage(Message(role = "assistant", content = aiResponseAccum, conversationId = "voice_call", isVoice = true))
+                }
+            }
+
             _userSpeechText.value = ""
+            viewModelScope.launch(Dispatchers.IO) { memoryManager.onUserMessage(userMessage) }
             return
         }
 
-        // 本地模型 — 使用身份角色系统提示
-        llmEngine.setSystemPrompt(sysPrompt)
-
-        InferenceService.start(app)
-        try { voicePipeline.voiceChat(text) }
-        finally {
-            InferenceService.stop(app)
-            if (isCallActive) {
-                _callState.value = VoiceCallState.LISTENING; _statusHint.value = "正在聆听..."
-                _aiResponseText.value = voiceResponseAccum
-                if (voiceResponseAccum.isNotBlank()) {
-                    viewModelScope.launch(Dispatchers.IO) {
-                        memoryManager.onAssistantMessage(Message(role = "assistant", content = voiceResponseAccum, conversationId = "voice_call", isVoice = true))
-                    }
-                }
-                _userSpeechText.value = ""
-            }
-            voicePipeline.onProcessingComplete()
-        }
+        _userSpeechText.value = ""
+        voicePipeline.onProcessingComplete()
+        _statusHint.value = "请先配置云端大模型"
         viewModelScope.launch(Dispatchers.IO) { memoryManager.onUserMessage(userMessage) }
     }
 

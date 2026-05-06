@@ -1,19 +1,16 @@
 package com.aicustomer.engine
 
 import android.util.Base64
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
-import kotlinx.coroutines.withContext
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
-import java.net.URL
-import javax.net.ssl.HttpsURLConnection
+import java.util.concurrent.atomic.AtomicBoolean
 
 class OpenAiClient(
     private val apiKey: String,
@@ -25,7 +22,15 @@ class OpenAiClient(
         .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         .build()
 
+    private val abortFlag = AtomicBoolean(false)
+    @Volatile private var activeCall: Call? = null
+
     fun isAvailable() = apiKey.isNotBlank()
+
+    fun abort() {
+        abortFlag.set(true)
+        activeCall?.cancel()
+    }
 
     fun testConnection(): Boolean {
         return try {
@@ -57,9 +62,12 @@ class OpenAiClient(
         userMessage: String
     ): Flow<String> {
         val channel = Channel<String>(Channel.UNLIMITED)
+        abortFlag.set(false)
 
         Thread {
             try {
+                if (abortFlag.get()) { channel.close(); return@Thread }
+
                 val messages = JSONArray().apply {
                     put(JSONObject().apply {
                         put("role", "system")
@@ -86,7 +94,9 @@ class OpenAiClient(
                     .post(body.toString().toRequestBody("application/json".toMediaType()))
                     .build()
 
-                val response = client.newCall(request).execute()
+                val call = client.newCall(request)
+                activeCall = call
+                val response = call.execute()
 
                 if (response.code != 200) {
                     channel.trySend("[云端请求失败: HTTP ${response.code}]")
@@ -96,8 +106,8 @@ class OpenAiClient(
 
                 response.body?.charStream()?.use { reader ->
                     val br = BufferedReader(reader)
-                    var line: String?
-                    while (br.readLine().also { line = it } != null) {
+                    var line: String? = null
+                    while (!abortFlag.get() && br.readLine().also { line = it } != null) {
                         val l = line ?: continue
                         if (l.startsWith("data: ")) {
                             val data = l.removePrefix("data: ")
@@ -117,8 +127,11 @@ class OpenAiClient(
                     }
                 }
             } catch (e: Exception) {
-                channel.trySend("[云端请求失败: ${e.message}]")
+                if (!abortFlag.get()) {
+                    channel.trySend("[云端请求失败: ${e.message}]")
+                }
             } finally {
+                activeCall = null
                 channel.close()
             }
         }.start()
