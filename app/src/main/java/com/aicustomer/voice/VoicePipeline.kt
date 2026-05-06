@@ -156,9 +156,13 @@ class VoicePipeline(
         initTts()
         for (sentence in ttsSentenceQueue) {
             if (!isActive) break
-            ttsSpeaking = true
-            state = State.SPEAKING
-            speakSentenceInternal(sentence)
+            try {
+                ttsSpeaking = true
+                state = State.SPEAKING
+                speakSentenceInternal(sentence)
+            } catch (e: Exception) {
+                Log.w("VoicePipeline", "TTS sentence failed: ${e.message}")
+            }
         }
         ttsSpeaking = false
         ttsEnergyBaseline = 0.0
@@ -417,6 +421,7 @@ class VoicePipeline(
         ttsSentenceQueue.cancel()
         recordScope?.cancel()
         recordScope = null
+        try { audioRecord?.stop() } catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
 

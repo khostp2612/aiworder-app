@@ -14,10 +14,15 @@ class XfyunAsrProvider(
     private val apiKey: String,
     private val apiSecret: String
 ) : AsrProvider {
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-        .build()
+    companion object {
+        val sharedClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+        }
+    }
+
     private var resultCallback: ((String) -> Unit)? = null
     private var interimCallback: ((String) -> Unit)? = null
     private var resultText = ""
@@ -37,7 +42,7 @@ class XfyunAsrProvider(
         if (hostUrl == null) { log("auth fail"); callback(""); return }
         val request = Request.Builder().url(hostUrl).build()
 
-        client.newWebSocket(request, object : WebSocketListener() {
+        sharedClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 val params = JSONObject().apply {
                     put("common", JSONObject().put("app_id", appId))

@@ -17,10 +17,14 @@ class OpenAiClient(
     private val endpoint: String = "https://api.deepseek.com/v1",
     private val model: String = "deepseek-chat"
 ) {
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-        .build()
+    companion object {
+        val sharedClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+        }
+    }
 
     private val abortFlag = AtomicBoolean(false)
     @Volatile private var activeCall: Call? = null
@@ -50,7 +54,7 @@ class OpenAiClient(
                 .addHeader("Content-Type", "application/json")
                 .post(body.toString().toRequestBody("application/json".toMediaType()))
                 .build()
-            val response = client.newCall(request).execute()
+            val response = sharedClient.newCall(request).execute()
             response.code == 200
         } catch (_: Exception) {
             false
@@ -94,7 +98,7 @@ class OpenAiClient(
                     .post(body.toString().toRequestBody("application/json".toMediaType()))
                     .build()
 
-                val call = client.newCall(request)
+                val call = sharedClient.newCall(request)
                 activeCall = call
                 val response = call.execute()
 
