@@ -16,7 +16,7 @@ class VadDetector(private val context: Context) {
         private const val MODEL_DIR = "vad-silero"
         private const val SAMPLE_RATE = 16000
         private const val WINDOW_SIZE = 512
-        private const val SILENCE_END_FRAMES = 10
+        private const val SILENCE_END_FRAMES = 7
 
         const val DEF_SPEECH_START_THRESHOLD = 0.70f
         const val DEF_SPEECH_CONTINUE_THRESHOLD = 0.50f

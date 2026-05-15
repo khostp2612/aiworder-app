@@ -32,8 +32,8 @@ class LocalAsrProvider(private val context: Context) : AsrProvider {
     companion object {
         private const val TAG = "LocalAsrProvider"
         private const val SPEECH_START_FRAMES = 3
-        private const val MIN_SPEECH_FRAMES = 12
-        private const val SILENCE_FRAMES_FOR_END = 12
+        private const val MIN_SPEECH_FRAMES = 8
+        private const val SILENCE_FRAMES_FOR_END = 8
         private const val CALIBRATION_FRAMES = 50
 
         private const val NOISE_FLOOR_CAP_FACTOR = 5.0
