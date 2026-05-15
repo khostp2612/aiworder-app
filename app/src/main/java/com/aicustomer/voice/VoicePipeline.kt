@@ -434,6 +434,9 @@ class VoicePipeline(private val context: Context) {
                     // Ceiling = 95th percentile of recent mic energy (TTS echo through MIC).
                     // During calibration: no barge-in possible — prevents self-interrupt from
                     // initial TTS burst.
+                    // During TTS silence gaps: freeze energy window to prevent zero-energy
+                    // contamination from collapsing the ceiling.
+                    if (ttsInSilenceGap) continue
                     if (graceOver) {
                         energyWindow.addLast(frameEnergy)
                         if (energyWindow.size > 60) energyWindow.removeFirst()
