@@ -18,6 +18,10 @@ import java.util.concurrent.atomic.AtomicLong
 
 class VoicePipeline(private val context: Context) {
 
+    companion object {
+        private const val DEBUG_BARGE = false
+    }
+
     private var systemTts: TextToSpeech? = null
     private var sherpaTts: SherpaTtsEngine? = null
     private var ttsInitDone = false
@@ -70,9 +74,9 @@ class VoicePipeline(private val context: Context) {
     private val diagFile = File("/sdcard/Download/aiworker_barge_diag.txt")
     private val diagFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
     private var diagLogCount = 0
-    private val DIAG_MAX_LINES = 200
 
     private fun diagLog(msg: String) {
+        if (!DEBUG_BARGE) return
         try {
             if (diagLogCount >= 800) return
             diagLogCount++
@@ -132,35 +136,40 @@ class VoicePipeline(private val context: Context) {
 
         recordScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-        // Start audio recording immediately — don't wait for ASR model loading
-        startListening()
-
-        // Load ASR models in background, enable ASR when ready
-        recordScope?.launch(Dispatchers.IO) {
-            try {
-                val ok = asrProvider.init()
-                diagLog("asrInit=$ok ready=${asrProvider.isReady()}")
-                log("ASR init result=$ok")
-            } catch (e: Exception) {
-                log("ASR init failed: ${e.message}")
-                this@VoicePipeline.isActive = false
-                state = State.IDLE
-                return@launch
+        // Load ASR models synchronously before starting audio.
+        // First call loads models (1-3s); subsequent calls return instantly
+        // because models stay resident via soft destroy.
+        try {
+            withContext(Dispatchers.IO) {
+                if (!asrProvider.init()) throw IllegalStateException("ASR provider init failed")
             }
+            diagLog("asrInit OK ready=${asrProvider.isReady()}")
+            log("ASR init OK")
+        } catch (e: Exception) {
+            diagLog("asrInit FAILED: ${e.message}")
+            log("ASR init failed: ${e.message}")
+            isActive = false
+            state = State.IDLE
+            return
         }
 
+        startListening()
+
         recordScope?.launch(Dispatchers.IO) {
-            try {
-                val st = SherpaTtsEngine(context)
-                st.loadBlocking()
-                if (st.isLoaded()) {
-                    sherpaTts = st
-                    log("Sherpa TTS loaded (local)")
-                } else {
-                    log("Sherpa TTS not available, will try system TTS")
+            // Load Sherpa TTS only if not already resident from previous call
+            if (sherpaTts?.isLoaded() != true) {
+                try {
+                    val st = SherpaTtsEngine(context)
+                    st.loadBlocking()
+                    if (st.isLoaded()) {
+                        sherpaTts = st
+                        log("Sherpa TTS loaded (local)")
+                    } else {
+                        log("Sherpa TTS not available, will try system TTS")
+                    }
+                } catch (e: Exception) {
+                    log("Sherpa TTS init error: ${e.message}")
                 }
-            } catch (e: Exception) {
-                log("Sherpa TTS init error: ${e.message}")
             }
         }
 
@@ -616,9 +625,6 @@ class VoicePipeline(private val context: Context) {
         audioRecord = null
 
         asrProvider.destroy()
-
-        try { sherpaTts?.unload() } catch (_: Exception) {}
-        sherpaTts = null
 
         try { systemTts?.stop() } catch (_: Exception) {}
         try { systemTts?.shutdown() } catch (_: Exception) {}

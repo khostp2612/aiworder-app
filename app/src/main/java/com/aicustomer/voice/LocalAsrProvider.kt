@@ -27,8 +27,6 @@ class LocalAsrProvider(private val context: Context) : AsrProvider {
 
     // Debug configurable thresholds
     private var energyMultiplier = 3.0
-    private var spectralStartThresh = SpectralGate.DEFAULT_SPEECH_START_THRESHOLD
-    private var spectralContinueThresh = SpectralGate.DEFAULT_SPEECH_CONTINUE_THRESHOLD
     private var minChineseRatio = DebugConfig.DEF_TEXT_MIN_CHINESE_RATIO
 
     companion object {
@@ -46,6 +44,16 @@ class LocalAsrProvider(private val context: Context) : AsrProvider {
     override fun getSpeechConfidence(): Float = currentSpeechConf
 
     override fun init(): Boolean {
+        // Model reuse: if STT/VAD already loaded from a previous call, skip reload.
+        // This makes subsequent calls instant (~1ms) instead of 2-3s.
+        if (stt?.isLoaded() == true && vad != null) {
+            reset()
+            calibrateEnergyThreshold()
+            ready = true
+            Log.i(TAG, "init SKIP (models reused), adaptiveThreshold=$adaptiveEnergyThreshold")
+            return true
+        }
+
         stt = SenseVoiceSttEngine(context)
         vad = VadDetector(context)
 
@@ -66,25 +74,13 @@ class LocalAsrProvider(private val context: Context) : AsrProvider {
             }
             calibrateEnergyThreshold()
             ready = true
-            Log.i(TAG, "init OK, spectral=$spectralEnabled, adaptiveThreshold=$adaptiveEnergyThreshold")
+            Log.i(TAG, "init OK (models loaded), spectral=$spectralEnabled, adaptiveThreshold=$adaptiveEnergyThreshold")
         } catch (e: Exception) {
             Log.e(TAG, "init failed", e)
             ready = false
             return false
         }
         return true
-    }
-
-    fun applyDebugConfig() {
-        // Thresholds set via DebugConfig will be reflected on next call start
-        energyMultiplier = DebugConfig.DEF_ENERGY_MULTIPLIER.toDouble()
-        spectralStartThresh = DebugConfig.DEF_SPECTRAL_START
-        spectralContinueThresh = DebugConfig.DEF_SPECTRAL_CONTINUE
-        vad?.speechStartThreshold = DebugConfig.DEF_VAD_SPEECH_START
-        vad?.speechContinueThreshold = DebugConfig.DEF_VAD_SPEECH_CONTINUE
-        vad?.confirmFrames = DebugConfig.DEF_VAD_CONFIRM_FRAMES.toInt()
-        audioPreprocessor.crestFactorMaxDb = DebugConfig.DEF_CREST_FACTOR_MAX
-        minChineseRatio = DebugConfig.DEF_TEXT_MIN_CHINESE_RATIO
     }
 
     private fun calibrateEnergyThreshold() {
@@ -179,13 +175,6 @@ class LocalAsrProvider(private val context: Context) : AsrProvider {
             speechFrameCount = 0
             energySilenceFrames = 0
             Log.d(TAG, "speech end, buffered frames=${audioBuffer.size / 512}")
-
-
-            speechActive = false
-            energyHighFrames = 0
-            speechFrameCount = 0
-            energySilenceFrames = 0
-            Log.d(TAG, "speech end, buffered frames=${audioBuffer.size / 512}")
             return AsrProvider.ProcessingResult(false, true, currentSpeechConf)
         }
 
@@ -273,6 +262,15 @@ class LocalAsrProvider(private val context: Context) : AsrProvider {
     }
 
     override fun destroy() {
+        // Soft destroy: clear internal state only. Keep STT/VAD models loaded
+        // for instant re-init on next call.
+        reset()
+        spectralGate?.reset()
+        ready = false
+    }
+
+    fun hardDestroy() {
+        // Full destroy: unload all ONNX models. Call only on app termination.
         stt?.unload()
         vad?.destroy()
         spectralGate = null
