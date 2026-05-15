@@ -4,7 +4,15 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+
+    <!-- 聊天气泡主体 (圆角矩形) -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M54,30 L74,50 L64,50 L64,78 L44,78 L44,50 L34,50 Z" />
+        android:pathData="M40,35 L68,35 A8,8 0,0,1 76,43 L76,61 A8,8 0,0,1 68,69 L60,69 L56,78 L52,69 L40,69 A8,8 0,0,1 32,61 L32,43 A8,8 0,0,1 40,35 Z" />
+
+    <!-- AI 星芒标记 (四角星) -->
+    <path
+        android:fillColor="#2563EB"
+        android:pathData="M54,43 L55.5,50 L63,52 L55.5,54 L54,61 L52.5,54 L45,52 L52.5,50 Z" />
+
 </vector>

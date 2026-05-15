@@ -27,6 +27,8 @@ class AudioPreprocessor {
         private const val AGC_RMS_SMOOTH_UP = 0.2f
         private const val AGC_RMS_SMOOTH_DOWN = 0.05f
         private const val AGC_CLIP_THRESHOLD = 0.95f
+
+        const val DEF_CREST_FACTOR_MAX_DB = 22f
     }
 
     private var dcPrevInput = 0f
@@ -38,6 +40,8 @@ class AudioPreprocessor {
     private var agcSmoothedRms = 0.01f
     private var agcAppRms = 0.01f
     private var agcSmoothedGain = 1.0f
+
+    var crestFactorMaxDb: Float = DEF_CREST_FACTOR_MAX_DB
 
     fun reset() {
         dcPrevInput = 0f
@@ -62,6 +66,37 @@ class AudioPreprocessor {
         }
         return process(result)
     }
+
+    /**
+     * Compute crest factor for a frame of raw audio samples.
+     * CFR = 20 * log10(peak / RMS). Returns value in dB.
+     * Speech: 12-20dB, Music: 6-12dB, Impulse (gunshots): >25dB
+     */
+    fun computeCrestFactor(samples: ShortArray): Float {
+        if (samples.isEmpty()) return 0f
+        var peak = 0f
+        var sumSq = 0.0
+        for (s in samples) {
+            val abs = abs(s.toFloat())
+            if (abs > peak) peak = abs
+            sumSq += s.toDouble() * s.toDouble()
+        }
+        val rms = sqrt(sumSq / samples.size).toFloat()
+        if (rms < 1f) return 0f
+        val cf = 20f * (ln(peak / rms) / ln(10f))
+        return cf.coerceIn(0f, 60f)
+    }
+
+    /**
+     * Check if frame is an impulse sound (e.g. gunshot, door slam, keyboard click).
+     * Impulse sounds have very high crest factor and should be rejected.
+     */
+    fun isImpulseNoise(samples: ShortArray): Boolean {
+        val cf = computeCrestFactor(samples)
+        return cf > crestFactorMaxDb
+    }
+
+    private fun abs(x: Float): Float = if (x < 0f) -x else x
 
     private fun applyDcBlocker(input: FloatArray): FloatArray {
         val output = FloatArray(input.size)

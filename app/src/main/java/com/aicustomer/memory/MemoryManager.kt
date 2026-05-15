@@ -38,12 +38,10 @@ class MemoryManager(
 
     fun onUserMessage(message: Message) {
         workingMemory.add(message)
-        Log.e("MEM_TEST", "1.onUser: '${message.content.take(30)}' workSize=${workingMemory.size()}")
+        Log.i("MemoryManager", "onUser: workSize=${workingMemory.size()}")
         scope.launch {
             val score = importanceScorer.score(message.content)
-            Log.e("MEM_TEST", "2.score=$score")
             if (score >= 6f) {
-                Log.e("MEM_TEST", "3.STORE: '${message.content.take(30)}' score=$score")
                 longTermMemory.store(message.content, currentConversationId, score, "user_preference")
             }
         }
@@ -51,22 +49,19 @@ class MemoryManager(
 
     fun onAssistantMessage(message: Message) {
         workingMemory.add(message)
-        Log.e("MEM_TEST", "4.onAssistant: '${message.content.take(30)}' workSize=${workingMemory.size()}")
+        Log.i("MemoryManager", "onAssistant: workSize=${workingMemory.size()}")
     }
 
     suspend fun onConversationEnd() {
         val messages = workingMemory.getMessages()
-        Log.e("MEM_TEST", "5.convEnd: ${messages.size} msgs")
         if (messages.size < 2) return
         val formatted = workingMemory.formatForPrompt()
         try {
             withContext(Dispatchers.IO) {
                 withTimeoutOrNull(30_000L) {
                     val summary = memoryCompressor.compress(formatted)
-                    Log.e("MEM_TEST", "6.summary: '${summary.take(50)}'")
                     shortTermMemory.store(summary, currentConversationId)
                     val facts = memoryCompressor.extractFacts(formatted)
-                    Log.e("MEM_TEST", "7.facts: ${facts.size}")
                     for (fact in facts) {
                         longTermMemory.store(fact, currentConversationId, importanceScorer.score(fact), "extracted_fact")
                     }
@@ -76,13 +71,11 @@ class MemoryManager(
             Log.e("MemoryManager", "Compression failed", e)
         }
         shortTermMemory.cleanup()
-        Log.e("MEM_TEST", "8.convEnd done. LTcount=${longTermMemory.count()}")
     }
 
     suspend fun deleteMemory(memory: Memory) {
         vectorIndex.remove(memory.id)
         memoryDao.delete(memory)
-        Log.e("MEM_TEST", "C.delete id=${memory.id} vecSize=${vectorIndex.size()}")
     }
 
     suspend fun importMemory(content: String, source: String, importanceScore: Float, tags: String = "") {
@@ -101,13 +94,13 @@ class MemoryManager(
         val parts = mutableListOf<String>()
         // 知识文档检索（最优先）
         val docs = longTermMemory.formatDocuments(currentQuery, topK = 3)
-        if (docs.isNotEmpty()) { parts.add(docs); Log.e("MEM_TEST", "D.docs found") }
+        if (docs.isNotEmpty()) parts.add(docs)
         if (embeddingEngine.isLoaded()) {
             val ltc = longTermMemory.formatForPrompt(currentQuery, topK = 3)
-            if (ltc.isNotEmpty()) { parts.add(ltc); Log.e("MEM_TEST", "A.longTerm found") }
+            if (ltc.isNotEmpty()) parts.add(ltc)
         }
         val stc = shortTermMemory.formatForPrompt(limit = 3)
-        if (stc.isNotEmpty()) { parts.add(stc); Log.e("MEM_TEST", "B.shortTerm found") }
+        if (stc.isNotEmpty()) parts.add(stc)
         return parts.joinToString("\n\n")
     }
 

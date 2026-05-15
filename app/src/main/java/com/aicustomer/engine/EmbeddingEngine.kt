@@ -1,13 +1,6 @@
 package com.aicustomer.engine
 
 import android.content.Context
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import org.json.JSONArray
-import org.json.JSONObject
-import java.util.concurrent.TimeUnit
 
 class EmbeddingEngine(private val context: Context) {
 
@@ -16,76 +9,31 @@ class EmbeddingEngine(private val context: Context) {
     }
 
     private var loaded = false
-    private var serverUrl: String? = null
-
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
-        .build()
+    private var localEngine: LocalEmbeddingEngine? = null
 
     suspend fun load(): Result<Unit> {
-        val prefs = context.getSharedPreferences("asr_prefs", android.content.Context.MODE_PRIVATE)
-        val cfUrl = prefs.getString("cf_url", "") ?: ""
-        if (cfUrl.isNotBlank()) {
-            serverUrl = cfUrl
-                .replace("ws://", "http://")
-                .replace("wss://", "https://")
-                .replace("/v1/transcribe", "/v1/embed")
+        try {
+            localEngine = LocalEmbeddingEngine(context)
+            val localResult = localEngine!!.load()
+            if (!localResult.isSuccess || !localEngine!!.isLoaded()) {
+                localEngine = null
+            }
+        } catch (e: Exception) {
+            localEngine = null
         }
+
         loaded = true
         return Result.success(Unit)
     }
 
     suspend fun embed(text: String): FloatArray {
-        val url = serverUrl
-        if (url == null) return hashBasedEmbedding(text)
-
-        return withContext(Dispatchers.IO) {
-            try {
-                val json = JSONObject().apply {
-                    put("texts", JSONArray().apply { put(text) })
-                }
-                val body = RequestBody.create("application/json".toMediaType(), json.toString())
-                val request = Request.Builder().url(url).post(body).build()
-                val response = client.newCall(request).execute()
-                val responseBody = response.body?.string() ?: return@withContext hashBasedEmbedding(text)
-                val result = JSONObject(responseBody)
-                if (result.has("error")) return@withContext hashBasedEmbedding(text)
-                val embeddings = result.getJSONArray("embeddings")
-                val first = embeddings.getJSONArray(0)
-                val arr = FloatArray(first.length())
-                for (i in arr.indices) arr[i] = first.getDouble(i).toFloat()
-                arr
-            } catch (e: Exception) {
-                hashBasedEmbedding(text)
-            }
-        }
+        if (localEngine?.isLoaded() == true) return localEngine!!.embed(text)
+        return hashBasedEmbedding(text)
     }
 
     suspend fun embedBatch(texts: List<String>): List<FloatArray> {
-        val url = serverUrl
-        if (url == null) return texts.map { hashBasedEmbedding(it) }
-
-        return withContext(Dispatchers.IO) {
-            try {
-                val arr = JSONArray()
-                for (t in texts) arr.put(t)
-                val json = JSONObject().apply { put("texts", arr) }
-                val body = RequestBody.create("application/json".toMediaType(), json.toString())
-                val request = Request.Builder().url(url).post(body).build()
-                val response = client.newCall(request).execute()
-                val responseBody = response.body?.string() ?: return@withContext texts.map { hashBasedEmbedding(it) }
-                val result = JSONObject(responseBody)
-                if (result.has("error")) return@withContext texts.map { hashBasedEmbedding(it) }
-                val embeddings = result.getJSONArray("embeddings")
-                (0 until embeddings.length()).map { i ->
-                    val vec = embeddings.getJSONArray(i)
-                    FloatArray(vec.length()) { j -> vec.getDouble(j).toFloat() }
-                }
-            } catch (e: Exception) {
-                texts.map { hashBasedEmbedding(it) }
-            }
-        }
+        if (localEngine?.isLoaded() == true) return texts.map { localEngine!!.embed(it) }
+        return texts.map { hashBasedEmbedding(it) }
     }
 
     private fun hashBasedEmbedding(text: String): FloatArray {
@@ -111,4 +59,5 @@ class EmbeddingEngine(private val context: Context) {
 
     fun getDimension(): Int = EMBEDDING_DIM
     fun isLoaded(): Boolean = loaded
+    fun isLocalEngineAvailable(): Boolean = localEngine?.isLoaded() == true
 }

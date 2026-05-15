@@ -14,9 +14,9 @@ import com.aicustomer.ui.theme.AICustomerTheme
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // 关闭过度滚动拉伸效果，兼容HarmonyOS Skia渲染管线
-        // 华为/鸿蒙的HWUI渲染器在处理StretchOverscrollNonClippingLayer时会崩溃
-        window.decorView.overScrollMode = View.OVER_SCROLL_NEVER
+        if (com.aicustomer.util.HarmonyCompat.shouldDisableOverscroll()) {
+            window.decorView.overScrollMode = View.OVER_SCROLL_NEVER
+        }
         setContent {
             AICustomerTheme {
                 Surface(

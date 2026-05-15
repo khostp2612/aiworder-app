@@ -27,12 +27,24 @@ android {
                 arguments += "-DBUILD_SHARED_LIBS=ON"
                 arguments += "-DLLAMA_BUILD_COMMON=ON"
                 arguments += "-DLLAMA_OPENSSL=OFF"
-                arguments += "-DGGML_NATIVE=OFF"
+                arguments += "-DGGML_VULKAN=OFF"
+                arguments += "-DGGML_NATIVE=ON"
                 arguments += "-DGGML_CPU_KLEIDIAI=OFF"
-                arguments += "-DGGML_LLAMAFILE=OFF"
+                arguments += "-DGGML_LLAMAFILE=ON"
                 arguments += "-DGGML_OPENMP=OFF"
                 arguments += "-DGGML_CCACHE=OFF"
                 arguments += "-DLLAMA_CURL=OFF"
+                // Cross-compilation ARM feature flags for SD8G2 hybrid cores
+                // All cores (X3+A715+A710+A510): dotprod ✅
+                // Only X3+A715: i8mm ❌, SVE ❌ (crashes on A710/A510)
+                arguments += "-DGGML_MACHINE_SUPPORTS_dotprod_EXITCODE=0"
+                arguments += "-DGGML_MACHINE_SUPPORTS_dotprod_EXITCODE__TRYRUN_OUTPUT=0"
+                arguments += "-DGGML_MACHINE_SUPPORTS_i8mm_EXITCODE=1"
+                arguments += "-DGGML_MACHINE_SUPPORTS_i8mm_EXITCODE__TRYRUN_OUTPUT=1"
+                arguments += "-DGGML_MACHINE_SUPPORTS_sve_EXITCODE=1"
+                arguments += "-DGGML_MACHINE_SUPPORTS_sve_EXITCODE__TRYRUN_OUTPUT=1"
+                // Preload CMake cache for cross-compilation ARM features
+                arguments += "-C${file("../native/arm64-cache.cmake").absolutePath}"
             }
         }
     }
@@ -77,8 +89,10 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
         jniLibs {
+            // libonnxruntime.so 由 sherpa-onnx AAR 内嵌版本提供（ORT ~1.24.x），
+            // 不参与 pickFirsts 冲突，避免 Maven 旧版 .so 覆盖导致 JNI ABI 不兼容闪退。
             pickFirsts += listOf("**/libc++_shared.so")
-            useLegacyPackaging = true  // 兼容 HarmonyOS，确保 extractNativeLibs 生效
+            useLegacyPackaging = false
         }
     }
 
@@ -113,9 +127,12 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
-    // Sherpa-ONNX (STT/TTS/VAD Java API) - 本地AAR依赖
-    // 需要先下载AAR到 app/libs/ 目录：
-    // curl -L -o app/libs/sherpa-onnx.aar https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.40/sherpa-onnx-1.12.40.aar
+    // ONNX Runtime — compileOnly: 只保留 Java API (EmbeddingEngine 需要 ai.onnxruntime.*)，
+    // native libonnxruntime.so 由 sherpa-onnx AAR 内嵌版本提供，避免版本冲突。
+    compileOnly("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
+
+    // Sherpa-ONNX (STT/TTS/VAD Java API) - 本地 AAR 依赖 (v1.13.2)
+    // curl -L -o app/libs/sherpa-onnx.aar https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-1.13.2.aar
     implementation(files("libs/sherpa-onnx.aar"))
 
     // JSON parsing
@@ -124,16 +141,16 @@ dependencies {
     // DataStore for preferences
     implementation("androidx.datastore:datastore-preferences:1.0.0")
 
-    // Encrypted SharedPreferences for API key storage
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
-
     debugImplementation("androidx.compose.ui:ui-tooling")
-
-    // OkHttp for Xfyun cloud ASR WebSocket
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     // Unit testing
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
     testImplementation("io.mockk:mockk:1.13.9")
+    testImplementation("org.junit.jupiter:junit-jupiter-api:5.10.2")
+    testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.10.2")
+}
+
+tasks.withType<Test> {
+    useJUnitPlatform()
 }

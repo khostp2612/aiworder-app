@@ -5,16 +5,17 @@ import android.content.Intent
 import android.os.Process
 import android.util.Log
 import com.aicustomer.data.local.AppDatabase
-import com.aicustomer.data.local.SecureStorage
+import com.aicustomer.data.model.Message
 import com.aicustomer.engine.EmbeddingEngine
 import com.aicustomer.engine.LlmEngine
 import com.aicustomer.engine.ModelManager
-
 import com.aicustomer.identity.IdentityManager
 import com.aicustomer.memory.MemoryManager
+import com.aicustomer.util.HarmonyCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -32,10 +33,9 @@ class App : Application() {
     lateinit var modelManager: ModelManager
         private set
 
-    lateinit var secureStorage: SecureStorage
-        private set
-
     var voiceCallViewModel: com.aicustomer.ui.viewmodel.VoiceCallViewModel? = null
+
+    val pendingVoiceTranscripts = MutableStateFlow<List<Message>>(emptyList())
 
     lateinit var database: AppDatabase
         private set
@@ -51,7 +51,8 @@ class App : Application() {
         instance = this
 
         // 全局异常捕获 - 捕获后重启Activity防止"屡次停止运行"
-        // 华为/鸿蒙限制：最多尝试重启1次，避免崩溃循环导致CPU飙升
+        // 崩溃重启保护：鸿蒙限制最多1次，标准Android允许多次
+        val maxCrashes = if (HarmonyCompat.isHarmonyOS()) 1 else 3
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             Log.e("App", "Uncaught exception on thread: ${thread.name}", throwable)
             val prefs = getSharedPreferences("crash_prefs", MODE_PRIVATE)
@@ -59,7 +60,7 @@ class App : Application() {
             val lastCrashTime = prefs.getLong("last_crash_time", 0)
             val now = System.currentTimeMillis()
 
-            if (crashCount == 1 || (crashCount <= 2 && (now - lastCrashTime) > 30000)) {
+            if (crashCount <= maxCrashes && (crashCount == 1 || (now - lastCrashTime) > 30000)) {
                 prefs.edit()
                     .putInt("crash_count", crashCount)
                     .putLong("last_crash_time", now)
@@ -82,16 +83,6 @@ class App : Application() {
 
         database = AppDatabase.getInstance(this)
 
-        secureStorage = SecureStorage(this)
-
-        // 清除测试阶段的污染记忆（只执行一次，后续可移除）
-        appScope.launch {
-            try {
-                database.memoryDao().deleteAllByType("short_term")
-                database.memoryDao().deleteAllByType("long_term")
-            } catch (_: Exception) {}
-        }
-
         embeddingEngine = EmbeddingEngine(this)
         llmEngine = LlmEngine(this)
         memoryManager = MemoryManager(this, embeddingEngine, llmEngine, database)
@@ -109,7 +100,6 @@ class App : Application() {
         appScope.launch {
             modelExtractionMutex.withLock {
                 try {
-                    // 1. 从assets提取内置0.5B模型（首次启动）
                     val extracted = modelManager.extractBundledModel()
                     if (!extracted) {
                         Log.w("App", "Bundled model extraction failed, app will need manual model install")
@@ -128,8 +118,10 @@ class App : Application() {
             }
 
             try {
-                // 不在启动时设置默认值，避免覆盖用户配置
-            } catch (_: Exception) {}
+                // init placeholder - no default values to avoid overriding user config
+            } catch (e: Exception) {
+                Log.w("App", "Init placeholder failed", e)
+            }
 
             // 加载知识文档
             try {

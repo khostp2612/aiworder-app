@@ -1,7 +1,7 @@
 package com.aicustomer.engine
 
-import android.content.Context
 import android.app.ActivityManager
+import android.content.Context
 import android.util.Log
 import com.aicustomer.App
 import kotlinx.coroutines.Dispatchers
@@ -13,9 +13,7 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * LLM推理引擎 - 纯本地llama.cpp推理
- *
- * 对齐 qwenchat 架构：全局单例 context + common 库 + Jinja 模板
+ * LLM推理引擎 - 纯本地llama.cpp推理，支持 GPU 加速
  */
 class LlmEngine(private val context: Context) {
 
@@ -34,13 +32,17 @@ class LlmEngine(private val context: Context) {
 
     // JNI Native 方法
     private external fun nativeSetDebugLogPath(path: String)
-    private external fun nativeInit(modelPath: String, nGpuLayers: Int): Boolean
+    private external fun nativeInit(modelPath: String, nGpuLayers: Int, nCtx: Int): Boolean
     private external fun nativeGenerateStreamCallback(enginePtr: Long, prompt: String, temperature: Float, maxTokens: Int)
     private external fun nativeGenerateSingle(enginePtr: Long, prompt: String, temperature: Float, maxTokens: Int): String
     private external fun nativeDestroy(enginePtr: Long)
     private external fun nativeAbort(enginePtr: Long)
     private external fun nativeGetContextSize(enginePtr: Long): Int
     private external fun nativeSetSystemPrompt(enginePtr: Long, systemPrompt: String)
+    private external fun nativeInitAudio(mmprojPath: String): Boolean
+    private external fun nativeGenerateWithAudio(prompt: String, pcm: FloatArray, nSamples: Int, temperature: Float, maxTokens: Int)
+    private external fun nativeIsAudioLoaded(): Boolean
+    private external fun nativeAudioDestroy()
 
     companion object {
         private var nativeLibLoaded = false
@@ -54,10 +56,14 @@ class LlmEngine(private val context: Context) {
             }
         }
 
-        private const val N_GPU_LAYERS = 0
-        private const val DEFAULT_MAX_TOKENS = 512
-        private const val DEFAULT_TEMPERATURE = 0.3f
-        private const val ENGINE_PTR_DUMMY = 1L  // 全局context不需要ptr，仅用于API兼容
+        private val defaultGpuLayers: Int by lazy {
+            val tier = DeviceTier.detect(App.instance)
+            if (tier.hasVulkan) 99 else 0
+        }
+
+        private const val DEFAULT_MAX_TOKENS = 1024
+        private const val DEFAULT_TEMPERATURE = 0.7f
+        private const val ENGINE_PTR_DUMMY = 1L
 
         private const val TAG = "LlmEngine"
     }
@@ -89,8 +95,15 @@ class LlmEngine(private val context: Context) {
         val memInfo = ActivityManager.MemoryInfo()
         activityManager.getMemoryInfo(memInfo)
         val availableMB = memInfo.availMem / (1024 * 1024)
-        Log.i(TAG, "Available memory: ${availableMB}MB, required: ${requiredMB}MB")
-        return availableMB >= requiredMB
+        val tier = DeviceTier.detect(context)
+        val required = when {
+            tier.ramGB >= 12 -> 3000
+            tier.ramGB >= 8 -> 2500
+            tier.ramGB >= 6 -> 1500
+            else -> requiredMB
+        }
+        Log.i(TAG, "Device tier=${tier.name}, ram=${tier.ramGB}GB, vulkan=${tier.hasVulkan}, availableMB=$availableMB, requiredMB=$required")
+        return availableMB >= required
     }
 
     suspend fun loadModel(): Result<Unit> = runCatching {
@@ -111,8 +124,9 @@ class LlmEngine(private val context: Context) {
 
         Log.i(TAG, "Loading model: $modelPath")
 
+        val contextSize = DeviceTier.detect(context).maxContextSize
         val success = withContext(Dispatchers.IO) {
-            nativeInit(modelPath, N_GPU_LAYERS)
+            nativeInit(modelPath, defaultGpuLayers, contextSize)
         }
 
         if (!success) {
@@ -120,7 +134,7 @@ class LlmEngine(private val context: Context) {
         }
 
         isLoaded = true
-        Log.i(TAG, "Model loaded successfully!")
+        Log.i(TAG, "Model loaded successfully! GPU layers: $defaultGpuLayers")
     }
 
     suspend fun loadModelFromPath(modelPath: String): Result<Unit> = runCatching {
@@ -132,8 +146,9 @@ class LlmEngine(private val context: Context) {
 
         Log.i(TAG, "Switching to model: $modelPath")
 
+        val contextSize = DeviceTier.detect(context).maxContextSize
         val success = withContext(Dispatchers.IO) {
-            nativeInit(modelPath, N_GPU_LAYERS)
+            nativeInit(modelPath, defaultGpuLayers, contextSize)
         }
 
         if (!success) {
@@ -220,7 +235,7 @@ class LlmEngine(private val context: Context) {
         isLoaded = false
     }
 
-    fun getContextSize(): Int = 2048
+    fun getContextSize(): Int = DeviceTier.detect(context).maxContextSize
 
     fun isLoaded(): Boolean = isLoaded
     fun isGenerating(): Boolean = isGeneratingFlag.get()

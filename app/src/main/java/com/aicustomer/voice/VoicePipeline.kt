@@ -1,163 +1,193 @@
 package com.aicustomer.voice
 
 import android.content.Context
-import android.content.SharedPreferences
 import android.media.*
-import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.NoiseSuppressor
 import android.os.Handler
 import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
-import com.aicustomer.asr.CfAsrProvider
-import com.aicustomer.asr.XfyunAsrProvider
-import com.aicustomer.data.local.SecureStorage
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import com.aicustomer.engine.SherpaTtsEngine
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 
-class VoicePipeline(
-    private val context: Context
-) {
+class VoicePipeline(private val context: Context) {
+
     private var systemTts: TextToSpeech? = null
+    private var sherpaTts: SherpaTtsEngine? = null
     private var ttsInitDone = false
+    private var ttsInitFailed = false
     @Volatile private var isActive = false
     @Volatile var isProcessing = false
     private var audioRecord: AudioRecord? = null
-    private var cloudProvider: CfAsrProvider? = null
-    private var xfyunProvider: XfyunAsrProvider? = null
     private var recordScope: CoroutineScope? = null
     private var ttsConsumerJob: Job? = null
     private var recordJob: Job? = null
 
-    private val preprocessor = AudioPreprocessor()
-    private val prefs: SharedPreferences = context.getSharedPreferences("asr_prefs", Context.MODE_PRIVATE)
-    private val secureStorage = SecureStorage(context)
+    private val asrProvider: AsrProvider = LocalAsrProvider(context)
+    private val audioPreprocessor = AudioPreprocessor()
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val audioManager: AudioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private var audioRecordRetries = 0
 
-    // 自适应回声基线：EMA 追踪 TTS 播放时麦克风捕获的能量级别
-    private var ttsEnergyBaseline = 0.0
-    private var ttsBaselineCount = 0
-    private var consecutiveAbove = 0
-    private val TTS_BASELINE_SAMPLES = 20
-    private val TTS_INTERRUPT_MULTIPLIER = 2.5
-    private val CONSECUTIVE_FRAMES = 5
+    // Energy-based barge-in with percentile ceiling to prevent self-interrupt
+    private var bargeTtsFrameCount = 0
+    private var lastBargeInterruptTime = 0L
+    private val BARGE_CONSEC_FRAMES = 5
+    private val BARGE_COOLDOWN_MS = 1500L
+    private val TTS_GRACE_MS = 200L
+    private var bargeConsecAbove = 0
+    private var bargeEnergyCeiling = 0.0
+    private var bargeCeilingCooldown = 0
+    private val BARGE_CEILING_RATIO = 2.0
+    private var ttsStartTime = 0L
+    private val turnEpoch = AtomicLong(0)
+    @Volatile private var ttsInSilenceGap = false
+    @Volatile private var queuingAllowed = true
 
     enum class State { IDLE, LISTENING, THINKING, SPEAKING }
     var onStateChanged: ((State) -> Unit)? = null
-    var onInterimText: ((String) -> Unit)? = null
     var onFinalText: ((String) -> Unit)? = null
     var onAiToken: ((String) -> Unit)? = null
+    var onAmplitude: ((Float) -> Unit)? = null
+    var onAiInterrupted: (() -> Unit)? = null
+    var onEmptyEndpoint: (() -> Unit)? = null
+
     private var state = State.IDLE
         set(v) { field = v; mainHandler.post { onStateChanged?.invoke(v) } }
 
-    // TTS 队列 — 流式消费 LLM 句子
     private val ttsSentenceQueue = Channel<String>(Channel.UNLIMITED)
     @Volatile var ttsSpeaking = false
         private set
 
+    // File-based diagnostic log for OnePlus/ColorOS which suppresses logcat
+    private val diagFile = File("/sdcard/Download/aiworker_barge_diag.txt")
+    private val diagFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    private var diagLogCount = 0
+    private val DIAG_MAX_LINES = 200
+
+    private fun diagLog(msg: String) {
+        try {
+            if (diagLogCount >= 800) return
+            diagLogCount++
+            val ts = diagFmt.format(Date())
+            diagFile.appendText("$ts $msg\n")
+        } catch (_: Exception) {}
+    }
+
+    private val SAMPLE_RATE = 16000
+    private val CHUNK_MS = 32
+    private val MAX_SPEECH_MS = 15000L
+    private val LISTENING_TIMEOUT_MS = 30000L
+    private val THINKING_TIMEOUT_MS = 25000L
+    private val SPEAKING_TIMEOUT_MS = 30000L
+
+    private var speechStartTimeMs = 0L
+    private var listeningStartTimeMs = 0L
+    private var thinkingStartTimeMs = 0L
+    private var speakingStartTimeMs = 0L
+    private var consecutiveBlankEndpoints = 0
+    private val MAX_BLANK_ENDPOINTS = 4
+
+    private var speechActive = false
+    private var interruptStartedAt = 0L
+    private var recoverySilenceFrames = 0
+    private val energyWindow = ArrayDeque<Double>(20)
+
     private fun log(msg: String) { Log.i("VoicePipeline", msg) }
 
-    private val asrProviderType: String get() = secureStorage.getAsrProvider()
+    suspend fun startVoiceCall() {
+        log("START full-duplex (local ASR)")
+        diagFile.delete()
+        diagLogCount = 0
+        diagLog("===== Voice call STARTED =====")
 
-    private val cloudReady: Boolean get() {
-        if (asrProviderType == "xfyun") {
-            val appId = secureStorage.getXfyunAppId()
-            val apiKey = secureStorage.getXfyunApiKey()
-            val apiSecret = secureStorage.getXfyunApiSecret()
-            if (appId.isNotBlank() && apiKey.isNotBlank() && apiSecret.isNotBlank()) {
-                xfyunProvider = XfyunAsrProvider(appId, apiKey, apiSecret)
-                xfyunProvider?.onInterim = { text ->
-                    mainHandler.post { onInterimText?.invoke(text) }
-                }
-                return true
-            }
-            return false
-        }
-        if (cloudProvider != null && cloudProvider!!.isAvailable()) return true
-        val wsUrl = secureStorage.getCfUrl().ifBlank { prefs.getString("cf_url", "") ?: "" }
-        if (wsUrl.isNotBlank()) {
-            cloudProvider = CfAsrProvider(wsUrl)
-            return true
-        }
-        return false
-    }
-
-    private suspend fun initTts(): Boolean {
-        if (systemTts != null && ttsInitDone) return true
-        return suspendCancellableCoroutine { cont ->
-            systemTts?.stop(); systemTts?.shutdown()
-            systemTts = TextToSpeech(context) { status ->
-                if (status == TextToSpeech.SUCCESS) {
-                    val t = systemTts
-                    if (t != null) {
-                        var r = t.setLanguage(Locale.CHINESE)
-                        if (r !in listOf(TextToSpeech.LANG_AVAILABLE, 0)) r = t.setLanguage(Locale.SIMPLIFIED_CHINESE)
-                        ttsInitDone = r !in listOf(TextToSpeech.LANG_MISSING_DATA, TextToSpeech.LANG_NOT_SUPPORTED)
-                        if (ttsInitDone) {
-                            t.setSpeechRate(1.5f); t.setPitch(1.05f)
-                            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                            am.setStreamVolume(AudioManager.STREAM_MUSIC, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC), 0)
-                            t.setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
-                        }
-                    }
-                }
-                if (cont.isActive) cont.resume(ttsInitDone) {}
-            }
-        }
-    }
-
-    // ====== 全双工入口 ======
-
-    fun startVoiceCall() {
-        log("START full-duplex asr=$asrProviderType cloud=$cloudReady")
         isActive = true; isProcessing = false; state = State.LISTENING
-        recordScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        preprocessor.reset()
-        ttsEnergyBaseline = 0.0
-        ttsBaselineCount = 0
-        consecutiveAbove = 0
+        ttsInitFailed = false
+        audioRecordRetries = 0
+        consecutiveBlankEndpoints = 0
+        turnEpoch.incrementAndGet()
+        queuingAllowed = true
 
-        // 扬声器模式 + 硬件回声消除（由 VOICE_COMMUNICATION source 提供）
+        ttsInSilenceGap = false
+        bargeTtsFrameCount = 0
+        bargeConsecAbove = 0
+        bargeEnergyCeiling = 0.0
+        bargeCeilingCooldown = 0
+        energyWindow.clear()
+        lastBargeInterruptTime = 0L
+        listeningStartTimeMs = System.currentTimeMillis()
+        thinkingStartTimeMs = 0L
+        speakingStartTimeMs = 0L
+        audioPreprocessor.reset()
+
         audioManager.mode = AudioManager.MODE_NORMAL
         audioManager.isSpeakerphoneOn = true
 
-        if (asrProviderType == "cf" && cloudReady && cloudProvider != null) {
-            cloudProvider!!.onListening = {
-                if (isActive && !isProcessing) mainHandler.post { state = State.LISTENING }
+        recordScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        // Start audio recording immediately — don't wait for ASR model loading
+        startListening()
+
+        // Load ASR models in background, enable ASR when ready
+        recordScope?.launch(Dispatchers.IO) {
+            try {
+                val ok = asrProvider.init()
+                diagLog("asrInit=$ok ready=${asrProvider.isReady()}")
+                log("ASR init result=$ok")
+            } catch (e: Exception) {
+                log("ASR init failed: ${e.message}")
+                this@VoicePipeline.isActive = false
+                state = State.IDLE
+                return@launch
             }
-            cloudProvider!!.onFinalText = { text ->
-                if (isActive && !isProcessing) {
-                    isProcessing = true
-                    state = State.THINKING
-                    mainHandler.post { onFinalText?.invoke(text) }
-                }
-            }
-            cloudProvider!!.onError = { err ->
-                log("ASR error: $err")
-                isProcessing = false
-                if (isActive) startListening()
-            }
-            cloudProvider!!.connect()
         }
 
-        // 启动 TTS 队列消费者
+        recordScope?.launch(Dispatchers.IO) {
+            try {
+                val st = SherpaTtsEngine(context)
+                st.loadBlocking()
+                if (st.isLoaded()) {
+                    sherpaTts = st
+                    log("Sherpa TTS loaded (local)")
+                } else {
+                    log("Sherpa TTS not available, will try system TTS")
+                }
+            } catch (e: Exception) {
+                log("Sherpa TTS init error: ${e.message}")
+            }
+        }
+
         ttsConsumerJob = recordScope?.launch { ttsConsumerLoop() }
-
-        // 启动连续录音
-        startListening()
     }
-
-    // ====== TTS 流式播放 ======
 
     private suspend fun ttsConsumerLoop() {
         initTts()
+        val myEpoch = turnEpoch.get()
         for (sentence in ttsSentenceQueue) {
             if (!isActive) break
+            if (turnEpoch.get() != myEpoch) break
+            if (sentence == "__TURN_END__") {
+                ttsSpeaking = false
+        ttsInSilenceGap = false; bargeConsecAbove = 0; bargeTtsFrameCount = 0; bargeEnergyCeiling = 0.0; bargeCeilingCooldown = 0
+                speakingStartTimeMs = 0L
+                delay(800L)
+                isProcessing = false
+                listeningStartTimeMs = System.currentTimeMillis()
+                if (isActive) state = State.LISTENING
+                continue
+            }
             try {
                 ttsSpeaking = true
+                ttsStartTime = System.currentTimeMillis()
+                diagLog("TTS sentence START, bargeConsec=${bargeConsecAbove}")
+                if (speakingStartTimeMs == 0L) speakingStartTimeMs = ttsStartTime
                 state = State.SPEAKING
                 speakSentenceInternal(sentence)
             } catch (e: Exception) {
@@ -165,71 +195,160 @@ class VoicePipeline(
             }
         }
         ttsSpeaking = false
-        ttsEnergyBaseline = 0.0
-        ttsBaselineCount = 0
-        consecutiveAbove = 0
+        ttsInSilenceGap = false
+        speakingStartTimeMs = 0L
+        speakingStartTimeMs = 0L
         isProcessing = false
-        if (isActive) {
-            state = State.LISTENING
-        }
+        if (isActive) state = State.LISTENING
     }
 
-    /** 由 ViewModel 调用，将 LLM 流式输出的句子送入 TTS 队列 */
     fun queueTtsSentence(text: String) {
+        if (!queuingAllowed) return
         val t = text.replace(Regex("<[^>]*>"), "").replace(Regex("[*#_~`|\\\\]"), "").trim()
-        if (t.isNotBlank()) {
-            ttsSentenceQueue.trySend(t)
-        }
+        if (t.isNotBlank()) ttsSentenceQueue.trySend(t)
     }
+
+    fun queueTurnEnd() { ttsSentenceQueue.trySend("__TURN_END__") }
 
     private suspend fun speakSentenceInternal(text: String) {
-        if (!initTts()) return
-        suspendCancellableCoroutine<Unit> { cont ->
-            val id = "tts_${System.currentTimeMillis()}"
-            systemTts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(id: String?) {}
-                override fun onDone(id: String?) { if (id == id && cont.isActive) cont.resume(Unit) {} }
-                override fun onError(id: String?) { if (id == id && cont.isActive) cont.resume(Unit) {} }
-                @Deprecated("Deprecated in Java") override fun onError(id: String?, code: Int) { if (id == id && cont.isActive) cont.resume(Unit) {} }
-            })
-            systemTts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, id)
+        if (initTts()) {
+            try {
+                speakWithSystemTts(text)
+                return
+            } catch (e: Exception) {
+                Log.w("VoicePipeline", "System TTS speak failed: ${e.message}")
+            }
+        }
+
+        val st = sherpaTts
+        if (st != null && st.isLoaded()) {
+            try {
+                withContext(Dispatchers.IO) { st.playBlocking(text) }
+                return
+            } catch (e: Exception) {
+                Log.w("VoicePipeline", "Sherpa TTS failed: ${e.message}")
+            }
         }
     }
 
-    // ====== 中断 ======
+    private suspend fun speakWithSystemTts(text: String) {
+        val tts = systemTts ?: return
+        ttsInSilenceGap = false
+        suspendCancellableCoroutine<Unit> { cont ->
+            val id = "tts_${System.currentTimeMillis()}"
+            tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(id: String?) { ttsInSilenceGap = false }
+                override fun onDone(id: String?) { ttsInSilenceGap = true; if (cont.isActive) cont.resume(Unit, onCancellation = {}) }
+                override fun onError(id: String?) { ttsInSilenceGap = true; Log.w("VoicePipeline", "TTS onError id=$id"); if (cont.isActive) cont.resume(Unit, onCancellation = {}) }
+                @Deprecated("Deprecated in Java") override fun onError(id: String?, code: Int) { ttsInSilenceGap = true; Log.w("VoicePipeline", "TTS onError id=$id code=$code"); if (cont.isActive) cont.resume(Unit, onCancellation = {}) }
+            })
+            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, id)
+        }
+    }
 
-    /** 中断 AI 说话：停止 TTS，排空队列（不关闭 channel，可复用） */
+    private suspend fun initTts(): Boolean {
+        if (ttsInitFailed) return false
+        if (systemTts != null && ttsInitDone) return true
+        val ok = initSystemTts()
+        if (!ok) {
+            ttsInitFailed = true
+            log("TTS init failed, will skip all TTS playback")
+        }
+        return ok
+    }
+
+    private suspend fun initSystemTts(): Boolean = withTimeoutOrNull(5000L) {
+        withContext(Dispatchers.Main) {
+            suspendCancellableCoroutine { cont ->
+                systemTts?.stop(); systemTts?.shutdown()
+                systemTts = TextToSpeech(context) { status ->
+                    ttsInitDone = (status == TextToSpeech.SUCCESS)
+                    log("TTS init status=$status")
+                    if (ttsInitDone) {
+                        val t = systemTts
+                        if (t != null) {
+                            var r = t.setLanguage(Locale.CHINESE)
+                            if (r < 0) r = t.setLanguage(Locale.SIMPLIFIED_CHINESE)
+                            if (r < 0) r = t.setLanguage(Locale("zh"))
+                            if (r < 0) {
+                                val zh = t.voices?.find { it.locale.language == "zh" }
+                                if (zh != null) r = t.setVoice(zh)
+                            }
+                            ttsInitDone = r >= 0
+                            if (ttsInitDone) {
+                                t.setSpeechRate(1.5f)
+                                t.setPitch(1.05f)
+                            } else {
+                                log("TTS no Chinese voice. Available: ${t.voices?.map{it.locale}?.distinct()}")
+                            }
+                        }
+                    }
+                    if (cont.isActive) cont.resume(ttsInitDone, onCancellation = {})
+                }
+                if (ttsInitDone) {
+                    val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC), 0)
+                    systemTts?.setAudioAttributes(AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                }
+            }
+        }
+    } ?: false
+
     fun interruptAi() {
         log("interruptAi")
+        turnEpoch.incrementAndGet()
+        queuingAllowed = false
+        isProcessing = false
+        thinkingStartTimeMs = 0L
+
         systemTts?.stop()
+        sherpaTts?.stop()
+        try { audioManager.abandonAudioFocus(null) } catch (_: Exception) {}
+
         ttsConsumerJob?.cancel()
         ttsConsumerJob = null
         ttsSpeaking = false
-        ttsEnergyBaseline = 0.0
-        ttsBaselineCount = 0
-        consecutiveAbove = 0
-        // 排空但不关闭 channel
+        ttsInSilenceGap = false
+        bargeConsecAbove = 0
+        bargeTtsFrameCount = 0
+        bargeEnergyCeiling = 0.0
+        bargeCeilingCooldown = 0
+        energyWindow.clear()
+        lastBargeInterruptTime = System.currentTimeMillis()
         while (ttsSentenceQueue.tryReceive().isSuccess) { /* drain */ }
-        // 重建消费者
+
+        asrProvider.reset()
+        audioPreprocessor.reset()
+
+        interruptStartedAt = System.currentTimeMillis()
+        recoverySilenceFrames = 0
+        speakingStartTimeMs = 0L
+        consecutiveBlankEndpoints = 0
+        listeningStartTimeMs = System.currentTimeMillis()
+
+        state = State.LISTENING
+
         recordScope?.launch {
+            delay(30)
+            queuingAllowed = true
             ttsConsumerJob = launch { ttsConsumerLoop() }
         }
+
+        startListening()
+        mainHandler.post { onAiInterrupted?.invoke() }
     }
 
-    // ====== 连续录音 (Xfyun) ======
-
-    private var xfyunTranscribing = false
-
-    /** 创建启用硬件 AEC + NS 的 AudioRecord */
     private fun createAudioRecord(rate: Int, bufSz: Int): AudioRecord {
         audioRecord?.release()
         val rec = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION, rate,
+            MediaRecorder.AudioSource.MIC, rate,
             AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSz
         )
         if (rec.state == AudioRecord.STATE_INITIALIZED) {
-            try { AcousticEchoCanceler.create(rec.audioSessionId)?.let { it.enabled = true } } catch (_: Exception) {}
-            try { NoiseSuppressor.create(rec.audioSessionId)?.let { it.enabled = true } } catch (_: Exception) {}
+            // AEC/NoiseSuppressor not used with MIC source — ColorOS handles
+            // echo via hw routing. Keeping effects off avoids mic muting.
         }
         return rec
     }
@@ -237,158 +356,212 @@ class VoicePipeline(
     private fun startListening() {
         if (!isActive) return
         state = State.LISTENING
+        listeningStartTimeMs = System.currentTimeMillis()
         recordJob?.cancel()
-        recordJob = recordScope?.launch {
+        val scope = recordScope ?: run {
+            log("startListening: recordScope is null, abort")
+            return
+        }
+        recordJob = scope.launch {
             try {
-                when (asrProviderType) {
-                    "xfyun" -> xfyunContinuousLoop()
-                    else -> cfRecordLoop()
-                }
-            } catch (_: CancellationException) {}
+                recordLoop()
+            } catch (_: CancellationException) {
+            } catch (e: Exception) {
+                log("Record loop crashed: ${e.message}")
+                this@VoicePipeline.isActive = false
+                state = State.IDLE
+            }
         }
     }
 
-    private suspend fun xfyunContinuousLoop() {
-        val rate = 16000
-        val bufSz = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT) * 2
-        audioRecord = createAudioRecord(rate, bufSz)
+    private suspend fun recordLoop() {
+        val chunkSize = SAMPLE_RATE * CHUNK_MS / 1000
+        val bufSz = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT) * 2
+        audioRecord = createAudioRecord(SAMPLE_RATE, bufSz.coerceAtLeast(chunkSize * 4))
         if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+            log("AudioRecord init failed, retrying (attempt $audioRecordRetries)...")
+            audioRecordRetries++
+            if (audioRecordRetries > 3) {
+                log("AudioRecord failed after 3 retries, giving up")
+                isActive = false; state = State.IDLE
+                return
+            }
             delay(2000); if (isActive) startListening(); return
         }
         audioRecord?.startRecording()
 
-        val buf = ShortArray(bufSz / 2)
-        val allSamples = mutableListOf<Float>()
-        var silenceStart = 0L
-        var speechStarted = false
-        var speechStartTime = 0L
-        val SILENCE_TIMEOUT = 600L
-        val MAX_SPEECH_MS = 15000L
-        val ENERGY_WINDOW = 6
-        val energyHistory = ArrayDeque<Double>()
-        val BASE_SPEECH_ENERGY = 300.0
-        var interrupted = false
+        val buf = ShortArray(chunkSize)
+        val energyHistory = ArrayDeque<Double>(6)
         var lastHeartbeat = 0L
-        val startupChunks = mutableListOf<FloatArray>()
-        val INITIAL_BUFFER_FRAMES = 5  // ~200ms 预热缓冲
+        speechActive = false
 
         try {
             while (isActive) {
                 val n = audioRecord?.read(buf, 0, buf.size) ?: 0
-                if (n <= 0) { delay(10); continue }
+                if (n <= 0) {
+                    if (ttsSpeaking && bargeTtsFrameCount < 5) {
+                        diagLog("AudioRecord.read=$n during TTS!")
+                    }
+                    delay(5); continue
+                }
 
                 val now = System.currentTimeMillis()
                 if (now - lastHeartbeat > 5000) {
                     lastHeartbeat = now
-                    log("heartbeat proc=$isProcessing speaking=$ttsSpeaking buf=${allSamples.size} speech=$speechStarted trans=$xfyunTranscribing")
+                    log("stream heartbeat proc=$isProcessing speak=$ttsSpeaking speech=$speechActive state=$state")
                 }
 
                 val chunk = buf.copyOf(n)
-                val energy = chunk.map { it.toDouble() * it.toDouble() }.average()
+
+                val rawFloat = FloatArray(chunk.size) { chunk[it] / 32768.0f }
+
+                if (ttsSpeaking) {
+                    val frameEnergy = chunk.map { it.toDouble() * it.toDouble() }.average()
+                    bargeTtsFrameCount++
+
+                    val graceOver = (System.currentTimeMillis() - ttsStartTime) > TTS_GRACE_MS
+
+                    // Energy-based barge-in: only active AFTER ceiling is calibrated.
+                    // Ceiling = 95th percentile of recent mic energy (TTS echo through MIC).
+                    // During calibration: no barge-in possible — prevents self-interrupt from
+                    // initial TTS burst.
+                    if (graceOver) {
+                        energyWindow.addLast(frameEnergy)
+                        if (energyWindow.size > 60) energyWindow.removeFirst()
+
+                        val calibrated = bargeEnergyCeiling > 0 && energyWindow.size >= 15
+
+                        // Update ceiling every 5 frames when not in active detection
+                        if (bargeCeilingCooldown > 0) bargeCeilingCooldown--
+                        if (calibrated && bargeConsecAbove == 0 && bargeCeilingCooldown == 0 && bargeTtsFrameCount % 5 == 1) {
+                            val sorted = energyWindow.sorted()
+                            bargeEnergyCeiling = sorted[(sorted.size * 0.95).toInt().coerceIn(0, sorted.size - 1)]
+                        }
+
+                        // First calibration: compute initial ceiling when window fills
+                        if (!calibrated && energyWindow.size >= 15) {
+                            val sorted = energyWindow.sorted()
+                            bargeEnergyCeiling = sorted[(sorted.size * 0.95).toInt().coerceIn(0, sorted.size - 1)]
+                            diagLog("barge ceiling calibrated: ${bargeEnergyCeiling.toInt()}")
+                        }
+
+                        // Only count barge-in frames when ceiling is calibrated
+                        if (calibrated) {
+                            val threshold = (bargeEnergyCeiling * BARGE_CEILING_RATIO).coerceAtLeast(500.0)
+                            if (frameEnergy > threshold) {
+                                bargeConsecAbove++
+                                if (bargeConsecAbove >= 2) {
+                                    diagLog("barge f=$bargeTtsFrameCount fE=${frameEnergy.toInt()} ceil=${bargeEnergyCeiling.toInt()} thr=${threshold.toInt()} cons=$bargeConsecAbove")
+                                }
+                            } else {
+                                if (bargeConsecAbove > 0) {
+                                    bargeConsecAbove--
+                                    if (bargeConsecAbove == 0) {
+                                        bargeCeilingCooldown = 20
+                                        diagLog("barge reset, cooldown 20 frames")
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    val cooldownOver = (System.currentTimeMillis() - lastBargeInterruptTime) > BARGE_COOLDOWN_MS
+
+                    if (bargeConsecAbove >= BARGE_CONSEC_FRAMES && cooldownOver) {
+                        diagLog("!!! BARGE-IN TRIGGERED (energy ceiling ratio) !!!")
+                        interruptAi()
+                        isProcessing = false
+                        speechActive = false
+                    }
+
+                    if (speakingStartTimeMs > 0 && (now - speakingStartTimeMs) > SPEAKING_TIMEOUT_MS) {
+                        diagLog("SPEAKING timeout")
+                        interruptAi()
+                        consecutiveBlankEndpoints = 0
+                    }
+                    continue
+                }
+
+                val preprocessedFloat = audioPreprocessor.process(rawFloat)
+                val preprocessedShort = ShortArray(preprocessedFloat.size) {
+                    (preprocessedFloat[it] * 32768f).toInt().coerceIn(-32768, 32767).toShort()
+                }
+
+                val energy = preprocessedShort.map { it.toDouble() * it.toDouble() }.average()
                 energyHistory.addLast(energy)
-                if (energyHistory.size > ENERGY_WINDOW) energyHistory.removeFirst()
+                if (energyHistory.size > 6) energyHistory.removeFirst()
                 val avgEnergy = energyHistory.average()
 
-                // 自适应回声基准：EMA 慢速追踪 TTS 回声能量
-                if (ttsSpeaking) {
-                    ttsEnergyBaseline = ttsEnergyBaseline * 0.95 + avgEnergy * 0.05
-                    ttsBaselineCount++
+                val amp = (Math.sqrt(avgEnergy) / 2000.0).coerceIn(0.0, 1.0)
+                onAmplitude?.invoke(amp.toFloat())
+
+                if (thinkingStartTimeMs > 0 && (now - thinkingStartTimeMs) > THINKING_TIMEOUT_MS) {
+                    log("THINKING timeout, force abort")
+                    isProcessing = false
+                    thinkingStartTimeMs = 0L
+                    listeningStartTimeMs = System.currentTimeMillis()
+                    consecutiveBlankEndpoints++
+                    state = State.LISTENING
+                    mainHandler.post { onAiInterrupted?.invoke() }
                 }
 
-                // 打断检测：能量连续超出 EMA 基线 × 2.5 → 用户说话 → 打断
-                if (ttsSpeaking && ttsBaselineCount >= TTS_BASELINE_SAMPLES) {
-                    if (avgEnergy > ttsEnergyBaseline * TTS_INTERRUPT_MULTIPLIER) {
-                        consecutiveAbove++
-                        if (consecutiveAbove >= CONSECUTIVE_FRAMES) {
-                            interruptAi()
-                            isProcessing = false
-                            interrupted = true
-                            consecutiveAbove = 0
-                            mainHandler.post { onAiInterrupted?.invoke() }
-                            allSamples.clear()
-                            xfyunProvider?.abortStream()
-                            xfyunTranscribing = false
-                            silenceStart = 0L
-                            speechStarted = false
-                            startupChunks.clear()
-                            delay(50)
-                        }
-                    } else {
-                        consecutiveAbove = 0
-                    }
-                }
+                if (!isProcessing && isRecoveryComplete(now, energy)) {
+                    val result = asrProvider.process(rawFloat, preprocessedFloat)
 
-                // 语音累积 + 静音检测：仅在聆听状态
-                if (!isProcessing) {
-                    if (avgEnergy > BASE_SPEECH_ENERGY) {
-                        if (!speechStarted) {
-                            speechStarted = true
-                            speechStartTime = now
-                            startupChunks.clear()
+                    if (result.isSpeech) {
+                        if (!speechActive) {
+                            log("SPEECH start")
+                            speechActive = true
+                            speechStartTimeMs = now
+                            listeningStartTimeMs = 0L
                         }
-                        silenceStart = 0L
-                        val processed = preprocessor.processShortToFloat(chunk)
-
-                        if (xfyunTranscribing) {
-                            // 已在流式中，直接发送
-                            xfyunProvider?.sendStreamAudio(processed, isEnd = false)
-                        } else if (startupChunks.size < INITIAL_BUFFER_FRAMES) {
-                            // 预热缓冲：先攒 200ms 音频让讯飞拿到完整起音
-                            startupChunks.add(processed)
-                            if (startupChunks.size >= INITIAL_BUFFER_FRAMES) {
-                                xfyunTranscribing = true
-                                xfyunProvider?.beginStream(rate) { text ->
-                                    xfyunTranscribing = false
-                                    startupChunks.clear()
-                                    Log.i("VoicePipeline", "xfyun stream: '${text.take(50)}'")
-                                    if (text.isNotBlank() && isActive && !isProcessing) {
-                                        isProcessing = true
-                                        state = State.THINKING
-                                        mainHandler.post { onFinalText?.invoke(text) }
-                                    }
-                                }
-                                // 一次性发送积压的预热音频
-                                startupChunks.forEach { xfyunProvider?.sendStreamAudio(it, isEnd = false) }
-                                startupChunks.clear()
-                            }
-                        }
-                    } else if (speechStarted) {
-                        val processed = preprocessor.processShortToFloat(chunk)
-                        if (xfyunTranscribing) {
-                            xfyunProvider?.sendStreamAudio(processed, isEnd = false)
-                        } else if (startupChunks.size < INITIAL_BUFFER_FRAMES) {
-                            startupChunks.add(processed)
-                            if (startupChunks.size >= INITIAL_BUFFER_FRAMES) {
-                                xfyunTranscribing = true
-                                xfyunProvider?.beginStream(rate) { text ->
-                                    xfyunTranscribing = false
-                                    startupChunks.clear()
-                                    Log.i("VoicePipeline", "xfyun stream: '${text.take(50)}'")
-                                    if (text.isNotBlank() && isActive && !isProcessing) {
-                                        isProcessing = true
-                                        state = State.THINKING
-                                        mainHandler.post { onFinalText?.invoke(text) }
-                                    }
-                                }
-                                startupChunks.forEach { xfyunProvider?.sendStreamAudio(it, isEnd = false) }
-                                startupChunks.clear()
-                            }
-                        }
-                        if (silenceStart == 0L) silenceStart = now
                     }
 
-                    val silenceDone = speechStarted && silenceStart > 0 && (now - silenceStart) > SILENCE_TIMEOUT
-                    val exceededMax = speechStarted && (now - speechStartTime) > MAX_SPEECH_MS
+                    if (speechActive && result.isEndpoint) {
+                        speechActive = false
+                        audioPreprocessor.reset()
+                        val final = asrProvider.finalize()
+                        log("STT final='$final' len=${final.length}")
+                        val meaningful = final.replace(Regex("""[\s。，！？；：、""」』）\)〕\}\]\[「『（\(〔\[]"""), "")
+                        if (meaningful.length >= 2) {
+                            consecutiveBlankEndpoints = 0
+                            isProcessing = true
+                            thinkingStartTimeMs = System.currentTimeMillis()
+                            state = State.THINKING
+                            mainHandler.post { onFinalText?.invoke(final) }
+                        } else {
+                            log("STT too short meaningful='$meaningful'")
+                            consecutiveBlankEndpoints++
+                            if (consecutiveBlankEndpoints >= MAX_BLANK_ENDPOINTS) {
+                                log("Too many blank/short endpoints, resetting")
+                                consecutiveBlankEndpoints = 0
+                                listeningStartTimeMs = System.currentTimeMillis()
+                                mainHandler.post { onEmptyEndpoint?.invoke() }
+                            }
+                        }
+                    }
 
-                    if ((silenceDone || exceededMax) && xfyunTranscribing) {
-                        log("xfyun stream end silence=$silenceDone max=$exceededMax")
-                        speechStarted = false
-                        silenceStart = 0L
-                        energyHistory.clear()
-                        interrupted = false
-                        startupChunks.clear()
-                        // 发送结束帧，Xfyun 已在实时处理，结果即刻返回
-                        xfyunProvider?.sendStreamAudio(FloatArray(0), isEnd = true)
+                    if (speechActive && (now - speechStartTimeMs) > MAX_SPEECH_MS) {
+                        speechActive = false
+                        audioPreprocessor.reset()
+                        val final = asrProvider.finalize()
+                        val meaningful = final.replace(Regex("""[\s。，！？；：、""」』）\)〕\}\]\[「『（\(〔\[]"""), "")
+                        log("STT max-duration final='$final' meaningful len=${meaningful.length}")
+                        if (meaningful.length >= 2) {
+                            consecutiveBlankEndpoints = 0
+                            isProcessing = true
+                            thinkingStartTimeMs = System.currentTimeMillis()
+                            state = State.THINKING
+                            mainHandler.post { onFinalText?.invoke(final) }
+                        }
+                    }
+
+                    if (!speechActive && !isProcessing && listeningStartTimeMs > 0 &&
+                        (now - listeningStartTimeMs) > LISTENING_TIMEOUT_MS) {
+                        log("LISTENING timeout")
+                        listeningStartTimeMs = 0L
+                        consecutiveBlankEndpoints = 0
+                        mainHandler.post { onEmptyEndpoint?.invoke() }
                     }
                 }
             }
@@ -399,81 +572,57 @@ class VoicePipeline(
         }
     }
 
-    /** AI 被打断通知 ViewModel */
-    var onAiInterrupted: (() -> Unit)? = null
-
-    // ====== CfAsr 录音循环 ======
-
-    private suspend fun cfRecordLoop() {
-        val rate = 16000
-        val bufSz = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT) * 2
-        audioRecord = createAudioRecord(rate, bufSz)
-        if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-            delay(2000); if (isActive && !isProcessing) startListening(); return
+    private fun isRecoveryComplete(now: Long, preprocessedEnergy: Double): Boolean {
+        if (interruptStartedAt == 0L) return true
+        val elapsed = now - interruptStartedAt
+        if (elapsed > 2000L) {
+            interruptStartedAt = 0L; recoverySilenceFrames = 0; return true
         }
-        audioRecord?.startRecording()
-
-        val buf = ShortArray(bufSz / 2)
-        try {
-            while (isActive && !isProcessing) {
-                val n = audioRecord?.read(buf, 0, buf.size) ?: 0
-                if (n <= 0) { delay(10); continue }
-                val chunk = buf.copyOf(n)
-                val processed = preprocessor.processShortToFloat(chunk)
-                cloudProvider?.sendAudioFloat(processed)
+        val threshold = 250.0
+        if (preprocessedEnergy < threshold) {
+            recoverySilenceFrames++
+            if (recoverySilenceFrames >= 5) {
+                interruptStartedAt = 0L; recoverySilenceFrames = 0; return true
             }
-        } finally {
-            try { audioRecord?.stop() } catch (_: Exception) {}
-            try { audioRecord?.release() } catch (_: Exception) {}
-            audioRecord = null
+        } else {
+            recoverySilenceFrames = 0
         }
+        return false
     }
-
-    // ====== 状态重置 ======
 
     fun onProcessingComplete() {
         isProcessing = false
-        // 循环自己还在跑，不需要重启
-        if (isActive && state != State.SPEAKING) {
-            state = State.LISTENING
-        }
+        thinkingStartTimeMs = 0L
+        listeningStartTimeMs = System.currentTimeMillis()
+        if (isActive && state != State.SPEAKING) state = State.LISTENING
     }
 
-    // ====== 结束通话 ======
-
     fun endCall() {
-        isActive = false
-        isProcessing = false
+        isActive = false; isProcessing = false
+        thinkingStartTimeMs = 0L
+        onAmplitude?.invoke(0f)
 
-        // 恢复音频模式
         try { audioManager.mode = AudioManager.MODE_NORMAL } catch (_: Exception) {}
         try { audioManager.isSpeakerphoneOn = false } catch (_: Exception) {}
         audioRecord?.apply {
-            try { AcousticEchoCanceler.create(audioSessionId)?.release() } catch (_: Exception) {}
-            try { NoiseSuppressor.create(audioSessionId)?.release() } catch (_: Exception) {}
+            // AEC/NS not used with MIC source
         }
-        recordJob?.cancel()
-        recordJob = null
-        ttsConsumerJob?.cancel()
-        ttsConsumerJob = null
+        recordJob?.cancel(); recordJob = null
+        ttsConsumerJob?.cancel(); ttsConsumerJob = null
         ttsSentenceQueue.cancel()
-        recordScope?.cancel()
-        recordScope = null
+        recordScope?.cancel(); recordScope = null
         try { audioRecord?.stop() } catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
 
-        try { cloudProvider?.disconnect() } catch (_: Exception) {}
-        cloudProvider = null
+        asrProvider.destroy()
 
-        try { xfyunProvider?.destroy() } catch (_: Exception) {}
-        xfyunProvider = null
+        try { sherpaTts?.unload() } catch (_: Exception) {}
+        sherpaTts = null
 
         try { systemTts?.stop() } catch (_: Exception) {}
         try { systemTts?.shutdown() } catch (_: Exception) {}
-        systemTts = null
-        ttsInitDone = false
-        ttsSpeaking = false
+        systemTts = null; ttsInitDone = false; ttsInitFailed = false; ttsSpeaking = false
         state = State.IDLE
     }
 

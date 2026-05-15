@@ -9,6 +9,8 @@
 #include <thread>
 #include <mutex>
 #include <fstream>
+#include <unistd.h>
+#include <algorithm>
 
 #include "llama.h"
 #include "common.h"
@@ -72,7 +74,7 @@ struct GenerationContext {
     jmethodID on_complete_method = nullptr;
     jmethodID on_error_method = nullptr;
 
-    int n_batch = 256;
+    int n_batch = 512;
     int n_len = 512;
     float temperature = 0.3f;
     float top_p = 0.8f;
@@ -83,6 +85,7 @@ static GenerationContext g_ctx;
 static std::mutex g_mutex;
 
 static void log_callback(ggml_log_level level, const char *text, void *user_data) {
+    if (strstr(text, "tensor[")) return;
     if (level <= GGML_LOG_LEVEL_WARN) {
         LOGE("%s", text);
     } else {
@@ -106,7 +109,7 @@ Java_com_aicustomer_engine_LlmEngine_nativeSetDebugLogPath(
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_aicustomer_engine_LlmEngine_nativeInit(
     JNIEnv *env, jobject thiz, jstring jpath,
-    jint nGpuLayers) {
+    jint nGpuLayers, jint nCtx) {
 
     std::lock_guard<std::mutex> lock(g_mutex);
 
@@ -114,7 +117,7 @@ Java_com_aicustomer_engine_LlmEngine_nativeInit(
     if (!path) return JNI_FALSE;
 
     LOGI("Loading model from: %s", path);
-    debug_log("nativeInit: path=%s", path);
+    debug_log("nativeInit: model loaded");
 
     ggml_log_set(log_callback, nullptr);
 
@@ -124,7 +127,10 @@ Java_com_aicustomer_engine_LlmEngine_nativeInit(
     g_ctx.n_len = 512;
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 0;
+    model_params.n_gpu_layers = nGpuLayers;
+
+    LOGI("GPU layers: %d, context size: %d", nGpuLayers, nCtx);
+    debug_log("GPU layers: %d, context: %d", nGpuLayers, nCtx);
 
     g_ctx.model = llama_model_load_from_file(path, model_params);
     if (!g_ctx.model) {
@@ -134,10 +140,24 @@ Java_com_aicustomer_engine_LlmEngine_nativeInit(
     }
 
     llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = 2048;
+    ctx_params.n_ctx = nCtx;
     ctx_params.n_batch = g_ctx.n_batch;
-    ctx_params.n_threads = 1;
-    ctx_params.n_threads_batch = 1;
+    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+
+    // 自适应线程数：留1核给UI/音频，其余用于推理
+    int cores = sysconf(_SC_NPROCESSORS_CONF);
+    if (cores <= 0) cores = 4;
+    int inference_threads = std::min(cores - 1, 8);
+    if (inference_threads < 1) inference_threads = 1;
+    int batch_threads = std::min(inference_threads, cores);
+
+    ctx_params.n_threads = inference_threads;
+    ctx_params.n_threads_batch = batch_threads;
+
+    LOGI("Using %d/%d cores for inference, %d for batch",
+         inference_threads, cores, batch_threads);
+    debug_log("Threads: infer=%d batch=%d cores=%d",
+              inference_threads, batch_threads, cores);
 
     g_ctx.ctx = llama_init_from_model(g_ctx.model, ctx_params);
     if (!g_ctx.ctx) {
@@ -152,9 +172,8 @@ Java_com_aicustomer_engine_LlmEngine_nativeInit(
     g_ctx.batch = llama_batch_init(g_ctx.n_batch, 0, 1);
     g_ctx.templates = common_chat_templates_init(g_ctx.model, "");
 
-    g_ctx.sampler = llama_sampler_init_greedy();
-
-    g_ctx.system_prompt = "You are Qwen, created by Alibaba Group. You are a helpful assistant.";
+    // Sampler is built per-generation in generation_thread() with current params
+    g_ctx.system_prompt = "You are Qwen, an AI assistant created by Alibaba Cloud. You are helpful, honest, and harmless.";
 
     env->ReleaseStringUTFChars(jpath, path);
     LOGI("Model loaded successfully");
@@ -226,7 +245,7 @@ static void generation_thread(JNIEnv *env, const std::string &user_input) {
     auto params = common_chat_templates_apply(g_ctx.templates.get(), inputs);
     std::string prompt = params.prompt;
 
-    debug_log("generation_thread: formatted prompt=%s", prompt.c_str());
+    // Security: do not log full prompt content
 
     // Tokenize the prompt
     std::vector<llama_token> prompt_tokens;
@@ -235,6 +254,21 @@ static void generation_thread(JNIEnv *env, const std::string &user_input) {
                                    prompt_tokens.data(), prompt_tokens.size(), true, true);
     prompt_tokens.resize(n_tokens);
     debug_log("Tokenized: %d tokens", n_tokens);
+
+    // Build sampler chain with current parameters
+    {
+        llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
+        g_ctx.sampler = llama_sampler_chain_init(sparams);
+        if (!g_ctx.sampler) {
+            send_error_to_java(env, "Sampler chain init failed");
+            return;
+        }
+        llama_sampler_chain_add(g_ctx.sampler, llama_sampler_init_temp(g_ctx.temperature));
+        llama_sampler_chain_add(g_ctx.sampler, llama_sampler_init_top_p(g_ctx.top_p, 1));
+        llama_sampler_chain_add(g_ctx.sampler, llama_sampler_init_top_k(g_ctx.top_k));
+        llama_sampler_chain_add(g_ctx.sampler, llama_sampler_init_min_p(0.05f, 1));
+        llama_sampler_chain_add(g_ctx.sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    }
 
     // Process prompt in batches
     int n_batch = g_ctx.n_batch;
@@ -249,6 +283,10 @@ static void generation_thread(JNIEnv *env, const std::string &user_input) {
         }
         if (llama_decode(g_ctx.ctx, g_ctx.batch) != 0) {
             send_error_to_java(env, "Decode failed during prompt processing");
+            if (g_ctx.sampler) {
+                llama_sampler_free(g_ctx.sampler);
+                g_ctx.sampler = nullptr;
+            }
             return;
         }
     }
@@ -283,8 +321,18 @@ static void generation_thread(JNIEnv *env, const std::string &user_input) {
 
         if (llama_decode(g_ctx.ctx, g_ctx.batch) != 0) {
             send_error_to_java(env, "Decode failed during generation");
+            if (g_ctx.sampler) {
+                llama_sampler_free(g_ctx.sampler);
+                g_ctx.sampler = nullptr;
+            }
             return;
         }
+    }
+
+    // Cleanup sampler
+    if (g_ctx.sampler) {
+        llama_sampler_free(g_ctx.sampler);
+        g_ctx.sampler = nullptr;
     }
 
     send_complete_to_java(env);
@@ -337,10 +385,7 @@ Java_com_aicustomer_engine_LlmEngine_nativeDestroy(JNIEnv *env, jobject thiz, jl
     std::lock_guard<std::mutex> lock(g_mutex);
     g_ctx.stop_flag = true;
 
-    if (g_ctx.sampler) {
-        llama_sampler_free(g_ctx.sampler);
-        g_ctx.sampler = nullptr;
-    }
+    // Sampler is per-generation, freed in generation_thread / audio_generation_thread
     if (g_ctx.batch.n_tokens >= 0) {
         llama_batch_free(g_ctx.batch);
     }
@@ -432,7 +477,7 @@ Java_com_aicustomer_engine_LlmEngine_nativeGenerateSingle(
 extern "C" JNIEXPORT jint JNICALL
 Java_com_aicustomer_engine_LlmEngine_nativeGetContextSize(
     JNIEnv *env, jobject thiz, jlong engine_ptr) {
-    return 2048;
+    return g_ctx.ctx ? llama_n_ctx(g_ctx.ctx) : 0;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -444,3 +489,4 @@ Java_com_aicustomer_engine_LlmEngine_nativeSetSystemPrompt(
         env->ReleaseStringUTFChars(system_prompt, sp);
     }
 }
+

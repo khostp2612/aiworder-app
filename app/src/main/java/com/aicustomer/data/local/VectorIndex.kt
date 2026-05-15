@@ -3,8 +3,8 @@ package com.aicustomer.data.local
 import kotlin.math.sqrt
 
 /**
- * 轻量向量索引 - 暴力余弦相似度搜索
- * 1000条以内记忆足够快，无需HNSW等复杂索引
+ * 轻量向量索引 - 预归一化余弦相似度搜索
+ * 插入时预归一化，搜索时只需点积，避免每次重复计算 norm
  */
 class VectorIndex {
 
@@ -13,6 +13,7 @@ class VectorIndex {
     data class VectorEntry(
         val id: Long,
         val embedding: FloatArray,
+        val normalizedEmbedding: FloatArray,
         val content: String
     )
 
@@ -25,7 +26,8 @@ class VectorIndex {
     @Synchronized
     fun add(id: Long, embedding: FloatArray, content: String) {
         entries.removeIf { it.id == id }
-        entries.add(VectorEntry(id, embedding, content))
+        val normalized = normalize(embedding)
+        entries.add(VectorEntry(id, embedding, normalized, content))
     }
 
     @Synchronized
@@ -43,31 +45,32 @@ class VectorIndex {
 
     /**
      * 余弦相似度搜索，返回Top-K结果
+     * 预归一化后余弦相似度 = 点积，无需每次算 norm
      */
     @Synchronized
     fun search(query: FloatArray, topK: Int = 5): List<SearchResult> {
         if (entries.isEmpty()) return emptyList()
 
-        val queryNorm = norm(query)
-        if (queryNorm < 1e-8f) return emptyList()
+        val queryNorm = normalize(query)
+        val queryNormValue = norm(query)
+        if (queryNormValue < 1e-8f) return emptyList()
 
         return entries.map { entry ->
-            val score = cosineSimilarity(query, queryNorm, entry.embedding)
-            SearchResult(entry.id, entry.content, score)
+            // 归一化后余弦相似度 = 点积
+            var dot = 0f
+            for (i in queryNorm.indices) {
+                dot += queryNorm[i] * entry.normalizedEmbedding[i]
+            }
+            SearchResult(entry.id, entry.content, dot)
         }
             .sortedByDescending { it.score }
             .take(topK)
     }
 
-    private fun cosineSimilarity(a: FloatArray, aNorm: Float, b: FloatArray): Float {
-        if (a.size != b.size) return 0f  // dimension mismatch protection
-        val bNorm = norm(b)
-        if (bNorm < 1e-8f) return 0f
-        var dot = 0f
-        for (i in a.indices) {
-            dot += a[i] * b[i]
-        }
-        return dot / (aNorm * bNorm)
+    private fun normalize(v: FloatArray): FloatArray {
+        val n = norm(v)
+        return if (n < 1e-8f) FloatArray(v.size)
+        else FloatArray(v.size) { v[it] / n }
     }
 
     private fun norm(v: FloatArray): Float {

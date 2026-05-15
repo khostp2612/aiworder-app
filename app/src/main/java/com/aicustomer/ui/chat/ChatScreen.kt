@@ -43,8 +43,6 @@ fun ChatScreen(
     val isModelLoaded by viewModel.isModelLoaded.collectAsState()
     val modelLoadError by viewModel.modelLoadError.collectAsState()
     val activeIdentityName by viewModel.activeIdentityName.collectAsState()
-    val useCloudLlm by viewModel.useCloudLlm.collectAsState()
-    val cloudAvailable by viewModel.cloudAvailable.collectAsState()
 
     var inputText by remember { mutableStateOf(TextFieldValue("")) }
     val listState = rememberLazyListState()
@@ -131,17 +129,6 @@ fun ChatScreen(
                                     else -> MaterialTheme.colorScheme.onSurfaceVariant
                                 }
                             )
-                        }
-                        if (cloudAvailable) {
-                            TextButton(
-                                onClick = { viewModel.toggleCloudLlm() },
-                                modifier = Modifier.defaultMinSize(minWidth = 40.dp, minHeight = 28.dp),
-                                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)
-                            ) {
-                                Icon(Icons.Default.Cloud, null, Modifier.size(12.dp), tint = if (useCloudLlm) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
-                                Spacer(Modifier.width(2.dp))
-                                Text(if (useCloudLlm) "云端" else "本地", style = MaterialTheme.typography.labelSmall, color = if (useCloudLlm) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
                         }
                     }
                 },
@@ -306,7 +293,7 @@ fun ChatScreen(
                     // 用文件名做标题
                     val name = uri.lastPathSegment ?: "导入文档"
                     if (docTitle.isBlank()) docTitle = name.removeSuffix(".txt").removeSuffix(".TXT")
-                } catch (_: Exception) {}
+                } catch (e: Exception) { android.util.Log.w("ChatScreen", "Import failed", e) }
             }
         }
         AlertDialog(

@@ -18,9 +18,7 @@ import com.aicustomer.R
  * 2. 防止CPU被系统降频，确保推理速度最大化
  * 3. 显示推理状态通知，让用户知道AI正在工作
  *
- * HarmonyOS 兼容性说明：
- * - foregroundServiceType 在 API 34+ 设备上使用 dataSync
- * - 在 HarmonyOS (API 31-32) 上不指定类型，避免兼容性问题
+ * API 34+ 设备上使用 dataSync 类型的 foreground service。
  */
 class InferenceService : Service() {
 
@@ -61,7 +59,6 @@ class InferenceService : Service() {
                 startForeground(NOTIFICATION_ID, notification)
             }
         } catch (e: SecurityException) {
-            // HarmonyOS 可能不支持 foregroundServiceType，降级到基本 startForeground
             Log.w(TAG, "startForeground with type failed, trying basic mode", e)
             startForeground(NOTIFICATION_ID, notification)
         }

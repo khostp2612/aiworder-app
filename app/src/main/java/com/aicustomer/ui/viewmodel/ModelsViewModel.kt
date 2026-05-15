@@ -5,17 +5,14 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.aicustomer.App
-import com.aicustomer.data.local.SecureStorage
 import com.aicustomer.engine.ModelManager
-import com.aicustomer.engine.OpenAiClient
-import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
 
 class ModelsViewModel(application: Application) : ViewModel() {
 
     private val app = application as App
     private val modelManager = app.modelManager
-    private val secureStorage = app.secureStorage
 
     private val _modelStatuses = MutableStateFlow<List<Pair<ModelManager.ModelInfo, Boolean>>>(emptyList())
     val modelStatuses: StateFlow<List<Pair<ModelManager.ModelInfo, Boolean>>> = _modelStatuses.asStateFlow()
@@ -29,164 +26,11 @@ class ModelsViewModel(application: Application) : ViewModel() {
     private val _downloadError = MutableStateFlow<String?>(null)
     val downloadError: StateFlow<String?> = _downloadError.asStateFlow()
 
-    // API Key state
-    private val _openAiKey = MutableStateFlow("")
-    val openAiKey: StateFlow<String> = _openAiKey.asStateFlow()
-    private val _openAiEndpoint = MutableStateFlow("")
-    val openAiEndpoint: StateFlow<String> = _openAiEndpoint.asStateFlow()
-    private val _openAiModel = MutableStateFlow("")
-    val openAiModel: StateFlow<String> = _openAiModel.asStateFlow()
-
-    private val _saveStatus = MutableStateFlow<String?>(null)
-    val saveStatus: StateFlow<String?> = _saveStatus.asStateFlow()
-
-    // CF ASR URL state
-    private val _cfUrl = MutableStateFlow("")
-    val cfUrl: StateFlow<String> = _cfUrl.asStateFlow()
-
-    // ASR provider preference
-    private val _asrProvider = MutableStateFlow("cf")
-    val asrProvider: StateFlow<String> = _asrProvider.asStateFlow()
-
-    // DeepSeek 独立凭证
-    private val _deepseekKey = MutableStateFlow("")
-    val deepseekKey: StateFlow<String> = _deepseekKey.asStateFlow()
-    private val _deepseekEndpoint = MutableStateFlow("")
-    val deepseekEndpoint: StateFlow<String> = _deepseekEndpoint.asStateFlow()
-    private val _deepseekModel = MutableStateFlow("")
-    val deepseekModel: StateFlow<String> = _deepseekModel.asStateFlow()
-
-    // 讯飞凭证
-    private val _xfyunAppId = MutableStateFlow("")
-    val xfyunAppId: StateFlow<String> = _xfyunAppId.asStateFlow()
-    private val _xfyunApiKey = MutableStateFlow("")
-    val xfyunApiKey: StateFlow<String> = _xfyunApiKey.asStateFlow()
-    private val _xfyunApiSecret = MutableStateFlow("")
-    val xfyunApiSecret: StateFlow<String> = _xfyunApiSecret.asStateFlow()
-
-    private val _useCloudLlm = MutableStateFlow(secureStorage.isCloudLlmEnabled())
-    val useCloudLlm: StateFlow<Boolean> = _useCloudLlm.asStateFlow()
-
-    sealed class ConnectionState {
-        data object Idle : ConnectionState()
-        data object Connecting : ConnectionState()
-        data object Connected : ConnectionState()
-        data class Failed(val message: String) : ConnectionState()
-    }
-
-    private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Idle)
-    val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
-
-    fun validateApiKey(key: String): String? {
-        if (key.isBlank()) return "API Key 不能为空"
-        if (key.length < 8) return "API Key 长度至少8位"
-        if (!key.matches(Regex("^[A-Za-z0-9._\\-/]+$"))) return "API Key 包含无效字符"
-        return null
-    }
-
-    fun testConnection(key: String, endpoint: String) {
-        val keyTrimmed = key.trim()
-        val endpointTrimmed = endpoint.ifBlank { "https://api.deepseek.com/v1" }
-        val validationError = validateApiKey(keyTrimmed)
-        if (validationError != null) {
-            _connectionState.value = ConnectionState.Failed(validationError)
-            return
-        }
-        _connectionState.value = ConnectionState.Connecting
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val client = OpenAiClient(keyTrimmed, endpointTrimmed, "deepseek-chat")
-                val result = withTimeoutOrNull(15_000L) {
-                    client.testConnection()
-                }
-                if (result == true) {
-                    _connectionState.value = ConnectionState.Connected
-                } else {
-                    _connectionState.value = ConnectionState.Failed("连接失败，请检查API Key和Endpoint")
-                }
-            } catch (_: Exception) {
-                _connectionState.value = ConnectionState.Failed("连接超时或网络不可达")
-            }
-        }
-    }
-
-    fun dismissConnectionState() {
-        _connectionState.value = ConnectionState.Idle
-    }
-
-    fun getOpenAiClient(): OpenAiClient? {
-        val key = secureStorage.getApiKey()
-        val endpoint = secureStorage.getEndpoint()
-        if (key.isBlank()) return null
-        return OpenAiClient(key, endpoint)
-    }
-
-    fun toggleCloudLlm() {
-        _useCloudLlm.value = !_useCloudLlm.value
-    }
-
-    init {
-        refreshStatuses()
-        loadApiKeys()
-    }
+    init { refreshStatuses() }
 
     fun refreshStatuses() {
         _modelStatuses.value = modelManager.getModelStatuses()
     }
-
-    fun loadApiKeys() {
-        _openAiKey.value = secureStorage.getApiKey()
-        _openAiEndpoint.value = secureStorage.getEndpoint()
-        _openAiModel.value = secureStorage.getModel()
-        _cfUrl.value = secureStorage.getCfUrl()
-        _asrProvider.value = secureStorage.getAsrProvider()
-        _deepseekKey.value = secureStorage.getDeepseekKey()
-        _deepseekEndpoint.value = secureStorage.getDeepseekEndpoint()
-        _deepseekModel.value = secureStorage.getDeepseekModel()
-        _xfyunAppId.value = secureStorage.getXfyunAppId()
-        _xfyunApiKey.value = secureStorage.getXfyunApiKey()
-        _xfyunApiSecret.value = secureStorage.getXfyunApiSecret()
-    }
-
-    fun saveOpenAiKey(key: String, endpoint: String, model: String) {
-        secureStorage.setApiKey(key)
-        secureStorage.setEndpoint(endpoint)
-        secureStorage.setModel(model)
-        loadApiKeys()
-        _saveStatus.value = "OpenAI 凭证已保存"
-    }
-
-    fun saveCfUrl(url: String) {
-        secureStorage.setCfUrl(url)
-        loadApiKeys()
-        _saveStatus.value = "ASR WebSocket 地址已保存"
-    }
-
-    fun saveDeepseekKey(key: String, endpoint: String, model: String) {
-        secureStorage.setDeepseekKey(key)
-        secureStorage.setDeepseekEndpoint(endpoint)
-        secureStorage.setDeepseekModel(model)
-        loadApiKeys()
-        _useCloudLlm.value = true
-        _saveStatus.value = "DeepSeek 凭证已保存，云端模式已开启"
-    }
-
-    fun saveXfyunCredentials(appId: String, apiKey: String, apiSecret: String) {
-        secureStorage.setXfyunAppId(appId)
-        secureStorage.setXfyunApiKey(apiKey)
-        secureStorage.setXfyunApiSecret(apiSecret)
-        secureStorage.setAsrProvider("xfyun")
-        loadApiKeys()
-        _saveStatus.value = "讯飞语音凭证已保存，已自动切换为讯飞识别"
-    }
-
-    fun saveAsrProvider(provider: String) {
-        secureStorage.setAsrProvider(provider)
-        loadApiKeys()
-        _saveStatus.value = if (provider == "xfyun") "已切换到讯飞语音识别" else "已切换到 Cloudflare 语音识别"
-    }
-
-    fun dismissSaveStatus() { _saveStatus.value = null }
 
     fun downloadModel(modelInfo: ModelManager.ModelInfo) {
         viewModelScope.launch {

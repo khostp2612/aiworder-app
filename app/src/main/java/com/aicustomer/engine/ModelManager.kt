@@ -2,8 +2,10 @@ package com.aicustomer.engine
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -19,6 +21,8 @@ import java.net.URL
 import java.util.concurrent.atomic.AtomicReference
 
 class ModelManager(private val context: Context) {
+
+    private val modelScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     data class ModelInfo(
         val name: String,
@@ -45,35 +49,40 @@ class ModelManager(private val context: Context) {
         private const val PREFS_NAME = "model_prefs"
         private const val KEY_ACTIVE_LLM = "active_llm_dir"
 
-        val LLM_06B_DIR = "qwen3-0.6b"
+        val LLM_DIR = "qwen3-1.7b"
         val EMBED_DIR = "embed-gte-small-zh"
-        val STT_DIR = "stt-zipformer-zh"
+        val STT_DIR = "sense-voice"
         val VAD_DIR = "vad-silero"
-        val LLM_06B_FILE = "Qwen3-0.6B-Q8_0.gguf"
+        val TTS_DIR = "tts-vits-zh"
+
+        val LLM_FILE_Q4 = "Qwen3-1.7B-Q4_K_M.gguf"
     }
+
+    fun resolveModelFile(): String = LLM_FILE_Q4
 
     val models = listOf(
         ModelInfo(
-            name = "Qwen3-0.6B (Q8_0)",
-            dir = LLM_06B_DIR,
-            description = "内置模型，开箱即用",
-            sizeBytes = 639_446_688L,
-            downloadUrl = "",
-            requiredFiles = listOf(LLM_06B_FILE),
-            isBundled = true
+            name = "Qwen3-1.7B (Q4_K_M)",
+            dir = LLM_DIR,
+            description = "Qwen3 1.7B 端侧对话，约1.05GB，快速流畅",
+            sizeBytes = 1_056_000_000L,
+            downloadUrls = listOf(
+                "https://modelscope.cn/unsloth/Qwen3-1.7B-GGUF/resolve/master/Qwen3-1.7B-Q4_K_M.gguf"
+            ),
+            requiredFiles = listOf(LLM_FILE_Q4),
+            isBundled = false
         ),
         ModelInfo(
-            name = "Zipformer 中文 STT",
+            name = "SenseVoice 中文 STT (int8)",
             dir = STT_DIR,
-            description = "离线语音识别，开箱即用",
-            sizeBytes = 55_000_000L,
+            description = "ali-damo SenseVoice 离线语音识别，228MB，支持中英日韩粤",
+            sizeBytes = 228_000_000L,
             downloadUrls = listOf(
-                "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-zh-14M-2023-02-23.tar.bz2"
+                "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/resolve/main/model.int8.onnx",
+                "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2"
             ),
             requiredFiles = listOf(
-                "encoder-epoch-99-avg-1.onnx",
-                "decoder-epoch-99-avg-1.onnx",
-                "joiner-epoch-99-avg-1.onnx",
+                "model.int8.onnx",
                 "tokens.txt"
             ),
             isBundled = true
@@ -242,7 +251,7 @@ class ModelManager(private val context: Context) {
             val connection = url.openConnection() as HttpURLConnection
             connection.instanceFollowRedirects = false
             connection.connectTimeout = 30000
-            connection.readTimeout = 120000
+            connection.readTimeout = 600000
             connection.setRequestProperty("User-Agent", "AIWORK/1.0")
 
             val responseCode = connection.responseCode
@@ -338,11 +347,11 @@ class ModelManager(private val context: Context) {
     }
 
     fun areCoreModelsReady(): Boolean {
-        return isModelDownloaded(models[0]) || isModelDownloaded(models[1])
+        return models.any { it.dir == LLM_DIR && isModelDownloaded(it) }
     }
 
     fun getActiveLlmModel(): ModelInfo? {
-        return models.find { it.dir == LLM_06B_DIR && isModelDownloaded(it) }
+        return models.find { it.dir == LLM_DIR && isModelDownloaded(it) }
     }
 
     fun getActiveLlmModelPath(): String? {
@@ -352,7 +361,7 @@ class ModelManager(private val context: Context) {
         return if (modelFile.exists()) modelFile.absolutePath else null
     }
 
-    fun isUsingEnhancedModel(): Boolean = false
+    fun isUsingEnhancedModel(): Boolean = getActiveLlmModel()?.name?.contains("Q4_K_M") == true
 
     suspend fun extractBundledModel(): Boolean {
         var allOk = true
@@ -362,7 +371,6 @@ class ModelManager(private val context: Context) {
 
             if (allExtracted) {
                 Log.i(TAG, "Bundled model already extracted: ${bundledModel.dir}")
-                if (bundledModel.dir == LLM_06B_DIR) _activeLlmDir.value = bundledModel.dir
                 continue
             }
 
@@ -389,8 +397,6 @@ class ModelManager(private val context: Context) {
                         }
                     }
                 }
-
-                if (bundledModel.dir == LLM_06B_DIR) _activeLlmDir.value = bundledModel.dir
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to extract bundled model: ${bundledModel.dir}", e)
                 allOk = false
@@ -399,11 +405,10 @@ class ModelManager(private val context: Context) {
         return allOk
     }
 
-    fun startManualDownload(onComplete: (() -> Unit)? = null) {
-        val model15b = models[1]
-        if (isModelDownloaded(model15b)) {
+    fun startManualDownload(modelInfo: ModelInfo, onComplete: (() -> Unit)? = null) {
+        if (isModelDownloaded(modelInfo)) {
             _upgradeProgress.value = 1f
-            _activeLlmDir.value = model15b.dir
+            _activeLlmDir.value = modelInfo.dir
             return
         }
 
@@ -411,24 +416,28 @@ class ModelManager(private val context: Context) {
             return
         }
 
-        kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
+        modelScope.launch {
             try {
                 _upgradeProgress.value = 0f
-                Log.i(TAG, "Starting manual download of 1.5B model...")
+                Log.i(TAG, "Starting download of ${modelInfo.name}...")
 
-                downloadModel(model15b).collect { progress ->
+                downloadModel(modelInfo).collect { progress ->
                     _upgradeProgress.value = progress
                 }
 
-                if (isModelDownloaded(model15b)) {
-                    _activeLlmDir.value = model15b.dir
-                    Log.i(TAG, "1.5B model downloaded, ready to switch")
+                if (isModelDownloaded(modelInfo)) {
+                    _activeLlmDir.value = modelInfo.dir
+                    Log.i(TAG, "${modelInfo.name} downloaded, ready to switch")
                     onComplete?.invoke()
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Manual download failed", e)
+                Log.e(TAG, "Download failed", e)
                 _upgradeProgress.value = -1f
             }
         }
+    }
+
+    fun destroy() {
+        modelScope.cancel()
     }
 }

@@ -1,18 +1,21 @@
 package com.aicustomer.ui.viewmodel
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.aicustomer.App
 import com.aicustomer.data.model.Message
 import com.aicustomer.engine.InferenceService
-import com.aicustomer.engine.OpenAiClient
-import com.aicustomer.identity.PromptBuilder
+import com.aicustomer.identity.VoicePromptBuilder
+import com.aicustomer.util.VoiceTextCleaner
 import com.aicustomer.voice.VoicePipeline
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 enum class VoiceCallState { IDLE, LISTENING, THINKING, SPEAKING }
 
@@ -20,9 +23,10 @@ class VoiceCallViewModel(application: Application) : ViewModel() {
 
     private val app = application as App
     init { app.voiceCallViewModel = this }
+    private val llmEngine = app.llmEngine
     private val memoryManager = app.memoryManager
     private val identityManager = app.identityManager
-    private val promptBuilder = PromptBuilder()
+    private val voicePromptBuilder = VoicePromptBuilder()
 
     val voicePipeline = VoicePipeline(context = application)
 
@@ -36,16 +40,16 @@ class VoiceCallViewModel(application: Application) : ViewModel() {
     val aiResponseText: StateFlow<String> = _aiResponseText.asStateFlow()
     private val _statusHint = MutableStateFlow("点击开始通话")
     val statusHint: StateFlow<String> = _statusHint.asStateFlow()
+    private val _amplitude = MutableStateFlow(0f)
+    val amplitude: StateFlow<Float> = _amplitude.asStateFlow()
     private var isCallActive = false
     private var callStartTime = 0L
     private var callEnded = false
 
-    // 流式累积
     private var aiResponseAccum = ""
     private var lastSpeakIdx = 0
-
-    // 活跃的 LLM 客户端（用于中断）
-    @Volatile private var activeClient: OpenAiClient? = null
+    private val voiceTranscripts = mutableListOf<Message>()
+    private var inferenceRefCount = 0
 
     init {
         voicePipeline.onStateChanged = { s ->
@@ -58,14 +62,11 @@ class VoiceCallViewModel(application: Application) : ViewModel() {
                 }
             }
         }
-        voicePipeline.onInterimText = { t ->
-            viewModelScope.launch { _userSpeechText.value = t }
-        }
         voicePipeline.onFinalText = { t ->
             viewModelScope.launch {
-                android.util.Log.i("VoiceCallVM", "onFinalText: '${t.take(50)}'")
+                Log.d("VoiceCallVM", "onFinalText: ${t.length} chars")
                 _userSpeechText.value = t
-                if (t.isNotBlank()) processUserSpeech(t)
+                if (t.isNotBlank()) processUserText(t)
             }
         }
         voicePipeline.onAiToken = { t ->
@@ -74,12 +75,23 @@ class VoiceCallViewModel(application: Application) : ViewModel() {
         voicePipeline.onAiInterrupted = {
             viewModelScope.launch { handleAiInterrupted() }
         }
+        voicePipeline.onAmplitude = { a ->
+            _amplitude.value = a
+        }
+        voicePipeline.onEmptyEndpoint = {
+            viewModelScope.launch {
+                _statusHint.value = "未检测到语音，请再说一次"
+                _callState.value = VoiceCallState.LISTENING
+            }
+        }
     }
 
     fun startCall() {
         viewModelScope.launch {
-            val useCloud = app.secureStorage.isCloudLlmEnabled()
-            if (!useCloud) { _statusHint.value = "请先配置云端大模型"; return@launch }
+            if (!llmEngine.isLoaded()) {
+                _statusHint.value = "请先在聊天页加载本地模型"
+                return@launch
+            }
 
             callEnded = false
             isCallActive = true; callStartTime = System.currentTimeMillis()
@@ -93,7 +105,11 @@ class VoiceCallViewModel(application: Application) : ViewModel() {
     }
 
     fun sendTextMessage(text: String) {
-        viewModelScope.launch { processUserSpeech(text) }
+        viewModelScope.launch { processUserText(text) }
+    }
+
+    fun onOrbTapInterrupt() {
+        voicePipeline.interruptAi()
     }
 
     fun endCall() {
@@ -101,21 +117,29 @@ class VoiceCallViewModel(application: Application) : ViewModel() {
         callEnded = true
         isCallActive = false
         _callState.value = VoiceCallState.IDLE
-        activeClient?.abort()
-        activeClient = null
+        llmEngine.abort()
         voicePipeline.endCall()
+        inferenceRefCount = 0
         InferenceService.stop(app)
+
+        if (voiceTranscripts.isNotEmpty()) {
+            app.pendingVoiceTranscripts.value = voiceTranscripts.toList()
+            voiceTranscripts.clear()
+        }
+
         viewModelScope.launch(Dispatchers.IO) {
-            try { memoryManager.onConversationEnd() } catch (_: Exception) {}
-            try { memoryManager.startNewConversation() } catch (_: Exception) {}
+            try { memoryManager.onConversationEnd() } catch (e: Exception) { Log.w("VoiceCallVM", "convEnd failed", e) }
+            try { memoryManager.startNewConversation() } catch (e: Exception) { Log.w("VoiceCallVM", "newConv failed", e) }
         }
     }
 
     private var generationId = 0L
+    private var turnTranscriptSaved = false
 
     private fun handleAiInterrupted() {
-        activeClient?.abort()
-        activeClient = null
+        saveTurnTranscriptIfNeeded(isAborted = true)
+        llmEngine.abort()
+        voicePipeline.isProcessing = false
         generationId++
         aiResponseAccum = ""
         lastSpeakIdx = 0
@@ -124,35 +148,97 @@ class VoiceCallViewModel(application: Application) : ViewModel() {
         _callState.value = VoiceCallState.LISTENING
     }
 
-    private suspend fun processUserSpeech(text: String) {
+    private fun saveTurnTranscriptIfNeeded(isAborted: Boolean) {
+        if (turnTranscriptSaved) return
+        turnTranscriptSaved = true
+
+        val userText = _userSpeechText.value
+        val aiText = aiResponseAccum
+
+        if (userText.isBlank() && aiText.isBlank()) return
+
+        if (userText.isNotBlank()) {
+            val userMsg = Message(
+                role = "user",
+                content = userText,
+                conversationId = "current",
+                isVoice = true
+            )
+            voiceTranscripts.add(userMsg)
+            viewModelScope.launch(Dispatchers.IO) {
+                app.database.messageDao().insert(userMsg)
+            }
+        }
+
+        if (aiText.isNotBlank()) {
+            val cleanAi = VoiceTextCleaner.cleanForSpeech(aiText)
+            val content = if (isAborted) "$cleanAi\n(已打断)" else cleanAi
+            val assistantMsg = Message(
+                role = "assistant",
+                content = content,
+                conversationId = "current",
+                isVoice = true
+            )
+            voiceTranscripts.add(assistantMsg)
+            viewModelScope.launch(Dispatchers.IO) {
+                app.database.messageDao().insert(assistantMsg)
+            }
+            if (isCallActive) {
+                viewModelScope.launch(Dispatchers.IO) {
+                    memoryManager.onAssistantMessage(
+                        Message(
+                            role = "assistant",
+                            content = aiText,
+                            conversationId = "voice_call",
+                            isVoice = true
+                        )
+                    )
+                }
+            }
+        }
+
+        _userSpeechText.value = ""
+    }
+
+    private suspend fun processUserText(text: String) {
+        turnTranscriptSaved = false
         _statusHint.value = "思考中..."; _callState.value = VoiceCallState.THINKING
         _aiResponseText.value = ""; aiResponseAccum = ""; lastSpeakIdx = 0
         generationId++
         val myGenId = generationId
 
-        val userMessage = Message(role = "user", content = text, conversationId = "voice_call", isVoice = true)
+        // Start foreground service early, overlap with memory context building
+        InferenceService.start(app)
+        inferenceRefCount++
 
-        val identity = identityManager.getActiveIdentity()
-        val memCtx = memoryManager.buildMemoryContext(text)
-        val sysPrompt = promptBuilder.build(identity, memCtx)
+        // Build memory context + system prompt on IO thread to avoid blocking Main
+        withContext(Dispatchers.IO) {
+            val systemPrompt = voicePromptBuilder.build(
+                identityManager.getActiveIdentity(),
+                memoryManager.buildMemoryContext(text)
+            )
+            llmEngine.setSystemPrompt(systemPrompt)
+        }
 
-        val cloudKey = app.secureStorage.getDeepseekKey().ifBlank { app.secureStorage.getApiKey() }
-        if (cloudKey.isNotBlank()) {
-            val endpoint = if (app.secureStorage.getDeepseekKey().isNotBlank()) app.secureStorage.getDeepseekEndpoint() else app.secureStorage.getEndpoint()
-            val model = if (app.secureStorage.getDeepseekKey().isNotBlank()) app.secureStorage.getDeepseekModel() else app.secureStorage.getModel()
-            val client = OpenAiClient(cloudKey, endpoint, model)
-            activeClient = client
-            InferenceService.start(app)
+        generateAndStream(text, myGenId)
+    }
 
-            var wasAborted = false
-            try {
-                kotlinx.coroutines.withContext(Dispatchers.IO) {
-                    client.chatStream(sysPrompt, text).collect { token ->
+    private suspend fun generateAndStream(text: String, myGenId: Long) {
+        if (!llmEngine.isLoaded()) {
+            voicePipeline.onProcessingComplete()
+            _statusHint.value = "本地模型未加载"
+            return
+        }
+
+        var wasAborted = false
+        try {
+            withContext(Dispatchers.IO) {
+                withTimeoutOrNull(90_000L) {
+                    llmEngine.generateStream(text).collect { token ->
                         if (generationId != myGenId) { wasAborted = true; throw kotlinx.coroutines.CancellationException("interrupted") }
-                        if (token.startsWith("[云端请求失败")) {
-                            aiResponseAccum = token
-                            return@collect
-                        }
+                        if (token == "__GEN_START__" || token.startsWith("[")) return@collect
+                        if (token == "<|im_end|>" || token == "</s>") return@collect
+
                         aiResponseAccum += token
                         _aiResponseText.value = aiResponseAccum
 
@@ -162,56 +248,78 @@ class VoiceCallViewModel(application: Application) : ViewModel() {
                             if (idx >= 0) {
                                 val sentence = current.substring(lastSpeakIdx, idx + 1).trim()
                                 if (sentence.isNotBlank() && sentence.length > 1) {
-                                    voicePipeline.queueTtsSentence(sentence)
+                                    voicePipeline.queueTtsSentence(VoiceTextCleaner.cleanForSpeech(sentence))
                                 }
                                 lastSpeakIdx = idx + 1
                             }
                         }
                     }
                 }
-            } catch (_: kotlinx.coroutines.CancellationException) {
-                wasAborted = true
-            } catch (e: Exception) {
-                if (generationId != myGenId) wasAborted = true
-            } finally {
-                activeClient = null
-                InferenceService.stop(app)
             }
-
-            // 被打断则跳过后续处理
-            if (wasAborted || generationId != myGenId) {
-                _userSpeechText.value = ""
-                voicePipeline.onProcessingComplete()
-                return
-            }
-
-            // 剩余文本
-            if (aiResponseAccum.isNotBlank() && !aiResponseAccum.startsWith("[云端")) {
-                val remaining = aiResponseAccum.substring(lastSpeakIdx)
-                    .replace(Regex("<[^>]*>"), "").trim()
-                if (remaining.isNotBlank()) {
-                    voicePipeline.queueTtsSentence(remaining)
+        } catch (_: kotlinx.coroutines.CancellationException) {
+            wasAborted = true
+        } catch (e: Exception) {
+            Log.w("VoiceCallVM", "LLM generate error", e)
+            wasAborted = true
+        } finally {
+            if (inferenceRefCount > 0) {
+                inferenceRefCount--
+                if (inferenceRefCount <= 0) {
+                    InferenceService.stop(app)
+                    inferenceRefCount = 0
                 }
             }
+        }
 
-            if (isCallActive && aiResponseAccum.isNotBlank()) {
-                viewModelScope.launch(Dispatchers.IO) {
-                    memoryManager.onAssistantMessage(Message(role = "assistant", content = aiResponseAccum, conversationId = "voice_call", isVoice = true))
-                }
-            }
+        finishResponse(wasAborted, myGenId)
+    }
 
+    private fun finishResponse(wasAborted: Boolean, myGenId: Long) {
+        if (wasAborted || generationId != myGenId) {
+            saveTurnTranscriptIfNeeded(isAborted = true)
             _userSpeechText.value = ""
-            viewModelScope.launch(Dispatchers.IO) { memoryManager.onUserMessage(userMessage) }
+            voicePipeline.onProcessingComplete()
             return
         }
 
-        _userSpeechText.value = ""
+        turnTranscriptSaved = true
+
+        if (aiResponseAccum.isNotBlank()) {
+            val remaining = aiResponseAccum.substring(lastSpeakIdx)
+                .replace(Regex("<[^>]*>"), "").trim()
+            if (remaining.isNotBlank()) {
+                voicePipeline.queueTtsSentence(VoiceTextCleaner.injectSpice(VoiceTextCleaner.cleanForSpeech(remaining)))
+            }
+        }
+
+        voicePipeline.queueTurnEnd()
         voicePipeline.onProcessingComplete()
-        _statusHint.value = "请先配置云端大模型"
-        viewModelScope.launch(Dispatchers.IO) { memoryManager.onUserMessage(userMessage) }
+
+        val cleanText = VoiceTextCleaner.cleanForSpeech(aiResponseAccum)
+        val assistantMsg = Message(role = "assistant", content = cleanText, conversationId = "current", isVoice = true)
+        val voiceUserMsg = Message(role = "user", content = _userSpeechText.value.ifBlank { "(语音)" }, conversationId = "current", isVoice = true)
+        voiceTranscripts.add(voiceUserMsg)
+        voiceTranscripts.add(assistantMsg)
+
+        viewModelScope.launch(Dispatchers.IO) {
+            app.database.messageDao().insert(voiceUserMsg)
+            app.database.messageDao().insert(assistantMsg)
+        }
+
+        if (isCallActive && aiResponseAccum.isNotBlank()) {
+            viewModelScope.launch(Dispatchers.IO) {
+                memoryManager.onAssistantMessage(Message(role = "assistant", content = aiResponseAccum, conversationId = "voice_call", isVoice = true))
+            }
+        }
+
+        _userSpeechText.value = ""
     }
 
-    override fun onCleared() { super.onCleared(); endCall() }
+    override fun onCleared() {
+        super.onCleared()
+        endCall()
+        app.voiceCallViewModel = null
+    }
 
     class Factory(private val application: Application) : ViewModelProvider.Factory {
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
