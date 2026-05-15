@@ -26,3 +26,7 @@ out/
 .codeartsdoer
 .codebuddy
 *.gguf
+*.onnx
+*.aar
+app/libs/
+app/src/main/assets/models/
