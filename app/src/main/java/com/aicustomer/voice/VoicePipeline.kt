@@ -184,7 +184,7 @@ class VoicePipeline(private val context: Context) {
             if (turnEpoch.get() != myEpoch) break
             if (sentence == "__TURN_END__") {
                 ttsSpeaking = false
-        ttsInSilenceGap = false; bargeConsecAbove = 0; bargeTtsFrameCount = 0; bargeEnergyCeiling = 0.0; bargeCeilingCooldown = 0
+        ttsInSilenceGap = false; bargeConsecAbove = 0; bargeTtsFrameCount = 0; bargeCeilingCooldown = 0
                 speakingStartTimeMs = 0L
                 delay(800L)
                 isProcessing = false
@@ -441,7 +441,7 @@ class VoicePipeline(private val context: Context) {
                         energyWindow.addLast(frameEnergy)
                         if (energyWindow.size > 60) energyWindow.removeFirst()
 
-                        val calibrated = bargeEnergyCeiling > 0 && energyWindow.size >= 15
+                        val calibrated = bargeEnergyCeiling > 0.0 && energyWindow.size >= 30
 
                         // Update ceiling every 5 frames when not in active detection
                         if (bargeCeilingCooldown > 0) bargeCeilingCooldown--
@@ -451,7 +451,7 @@ class VoicePipeline(private val context: Context) {
                         }
 
                         // First calibration: compute initial ceiling when window fills
-                        if (!calibrated && energyWindow.size >= 15) {
+                        if (!calibrated && energyWindow.size >= 30) {
                             val sorted = energyWindow.sorted()
                             bargeEnergyCeiling = sorted[(sorted.size * 0.95).toInt().coerceIn(0, sorted.size - 1)]
                             diagLog("barge ceiling calibrated: ${bargeEnergyCeiling.toInt()}")
