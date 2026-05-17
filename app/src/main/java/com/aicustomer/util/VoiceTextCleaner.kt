@@ -11,6 +11,9 @@ object VoiceTextCleaner {
     fun cleanForSpeech(text: String): String {
         var t = text
 
+        // 0. 英文标点 → 中文标点（TTS 不朗读英文标点名称）
+        t = t.replace("?", "？").replace("!", "！")
+
         // 1. 移除 Markdown 加粗/斜体
         t = t.replace(Regex("\\*\\*(.+?)\\*\\*"), "$1")
         t = t.replace(Regex("\\*(.+?)\\*"), "$1")

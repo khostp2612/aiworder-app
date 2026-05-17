@@ -18,6 +18,7 @@ class LocalAsrProvider(private val context: Context) : AsrProvider {
     private var energyHighFrames = 0
     private var speechFrameCount = 0
     private var energySilenceFrames = 0
+    private var frameCounter = 0
 
     private var adaptiveEnergyThreshold = 5000.0
     private val noiseFloorHistory = ArrayDeque<Double>(50)
@@ -96,7 +97,9 @@ class LocalAsrProvider(private val context: Context) : AsrProvider {
         val noiseFloor = sorted[(sorted.size * 0.2).toInt().coerceIn(0, sorted.size - 1)]
         // Cap floor to prevent sustained music from raising threshold indefinitely
         val cappedFloor = noiseFloor.coerceAtMost(noiseFloorHistory.min() * NOISE_FLOOR_CAP_FACTOR)
-        adaptiveEnergyThreshold = (cappedFloor * energyMultiplier).coerceAtLeast(1000.0)
+        adaptiveEnergyThreshold = (cappedFloor * energyMultiplier)
+            .coerceAtLeast(8000.0)
+            .coerceAtMost(60000.0)
     }
 
     override fun process(rawChunk: FloatArray, preprocessedChunk: FloatArray): AsrProvider.ProcessingResult {
@@ -108,7 +111,8 @@ class LocalAsrProvider(private val context: Context) : AsrProvider {
 
         // L1: Crest factor check — reject impulse noise (gunshots, door slams, keyboard clicks)
         if (!speechActive && audioPreprocessor.isImpulseNoise(shortForVad)) {
-            currentSpeechConf = 0f
+        currentSpeechConf = 0f
+        frameCounter = 0
             return AsrProvider.ProcessingResult.SILENCE
         }
 
@@ -117,10 +121,9 @@ class LocalAsrProvider(private val context: Context) : AsrProvider {
 
         val isHighEnergy = energy > adaptiveEnergyThreshold
 
-        // L2: Spectral gate — run for confidence reference only, not as a hard gate.
-        // Hard gating is too aggressive for normal speech on mobile mics.
-        // The L5 text quality check handles false triggers from music/noise.
-        if (spectralEnabled && spectralGate != null) {
+        // Spectral gate — run every 5 frames for CPU efficiency.
+        frameCounter++
+        if (spectralEnabled && spectralGate != null && frameCounter % 5 == 0) {
             val features = spectralGate!!.analyze(rawChunk)
             currentSpeechConf = features.speechConfidence
         }
